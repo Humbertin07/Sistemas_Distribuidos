@@ -1,0 +1,16 @@
+# .gitignore
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# Docker
+.dockerignore
+
+# Node.js
+node_modules/
+
+# Dados
+server_data/
