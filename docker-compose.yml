@@ -6,9 +6,21 @@ services:
     ports:
       - "5555:5555"
 
+  message_server:
+    build:
+      context: ./message_server
+    container_name: message_server
+    ports:
+      - "5556:5556"
+      - "5557:5557" 
+
   client:
     build:
       context: ./client
     container_name: client
     depends_on:
       - auth_server
+      - message_server
+    stdin_open: true 
+    tty: true        
+    command: ["python", "-u", "client.py"] 

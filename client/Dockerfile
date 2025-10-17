@@ -6,4 +6,3 @@ RUN pip install pyzmq
 
 COPY client.py .
 
-CMD ["python", "-u", "client.py"]
