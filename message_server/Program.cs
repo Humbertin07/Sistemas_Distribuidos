@@ -1,7 +1,8 @@
 using NetMQ;
 using NetMQ.Sockets;
+using MessagePack;
 
-Console.WriteLine("Servidor de Mensagens (C#) iniciado...");
+Console.WriteLine("Servidor de Mensagens (C# / MessagePack) iniciado...");
 string logFile = "/data/messages.log";
 
 using (var repSocket = new ResponseSocket("@tcp://*:5557")) 
@@ -11,40 +12,55 @@ using (var pubSocket = new PublisherSocket("@tcp://*:5556"))
     Console.WriteLine("Socket PUB (broadcast) escutando na porta 5556.");
     Console.WriteLine($"Log de persistência em: {logFile}");
 
+    var options = MessagePackSerializerOptions.Standard.WithCompression(MessagePackCompression.Lz4Block);
+
     using (var poller = new NetMQPoller { repSocket })
     {
         repSocket.ReceiveReady += (s, a) =>
         {
-            string messageFromClient = repSocket.ReceiveFrameString();
-            Console.WriteLine($"Comando recebido: '{messageFromClient}'");
+            byte[] commandBytes = repSocket.ReceiveFrameBytes();
+            
+            Dictionary<string, string> commandData;
+            try
+            {
+                commandData = MessagePackSerializer.Deserialize<Dictionary<string, string>>(commandBytes, options);
+                Console.WriteLine($"Comando recebido: {commandData["command"]}:{commandData["topic"]}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Erro ao desserializar comando: {ex.Message}");
+                repSocket.SendFrame("ERROR: Formato inválido.");
+                return;
+            }
 
             try
             {
-                File.AppendAllText(logFile, $"{DateTime.UtcNow:O} | {messageFromClient}\n");
+                string logEntry = $"{DateTime.UtcNow:O} | {commandData["command"]}:{commandData["topic"]}:{commandData["payload"]}\n";
+                File.AppendAllText(logFile, logEntry);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Erro ao persistir log: {ex.Message}");
             }
 
-            string[] parts = messageFromClient.Split(':', 3);
-            if (parts.Length != 3)
-            {
-                repSocket.SendFrame("ERROR: Formato inválido. Use 'comando:topico:mensagem'.");
-                return;
-            }
-
-            string command = parts[0];
-            string topic = parts[1];   
-            string message = parts[2];
+            string command = commandData["command"];
+            string topic = commandData["topic"];
+            string payload = commandData["payload"];
 
             if (command == "publish" || command == "private")
             {
-                string broadcastMessage = $"[{topic}] {message}";
-                Console.WriteLine($"Transmitindo no tópico '{topic}': {broadcastMessage}");
+                string broadcastMessage = $"[{topic}] {payload}";
+                
+                var broadcastData = new Dictionary<string, string>
+                {
+                    { "message", broadcastMessage }
+                };
+                byte[] broadcastBytes = MessagePackSerializer.Serialize(broadcastData, options);
+
+                Console.WriteLine($"Transmitindo no tópico '{topic}'");
                 
                 pubSocket.SendMoreFrame(topic)
-                         .SendFrame(broadcastMessage); 
+                         .SendFrame(broadcastBytes); 
                 
                 repSocket.SendFrame("OK_ENVIADO");
             }
