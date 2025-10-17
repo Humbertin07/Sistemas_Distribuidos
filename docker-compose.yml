@@ -1,3 +1,4 @@
+# docker-compose.yml
 services:
   auth_server:
     build:
@@ -6,21 +7,33 @@ services:
     ports:
       - "5555:5555"
 
-  message_server:
+  message_server: 
     build:
       context: ./message_server
     container_name: message_server
     ports:
-      - "5556:5556"
+      - "5556:5556" 
       - "5557:5557" 
+    volumes:
+      - ./server_data:/data 
 
-  client:
+  client_py: 
     build:
       context: ./client
-    container_name: client
+    container_name: client_py
     depends_on:
       - auth_server
       - message_server
     stdin_open: true 
     tty: true        
-    command: ["python", "-u", "client.py"] 
+    command: ["python", "-u", "client.py"]
+
+  client_node: 
+    build:
+      context: ./client_node
+    container_name: client_node
+    depends_on:
+      - auth_server
+      - message_server
+    stdin_open: true
+    tty: true
