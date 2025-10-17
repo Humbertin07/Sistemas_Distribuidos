@@ -1,0 +1,14 @@
+services:
+  auth_server:
+    build:
+      context: ./auth_server
+    container_name: auth_server
+    ports:
+      - "5555:5555"
+
+  client:
+    build:
+      context: ./client
+    container_name: client
+    depends_on:
+      - auth_server
