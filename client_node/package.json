@@ -8,6 +8,7 @@
     "start": "node client.js"
   },
   "dependencies": {
-    "zeromq": "^6.0.0-beta.19"
+    "zeromq": "^6.0.0-beta.19",
+    "@msgpack/msgpack": "^3.0.0"
   }
 }
