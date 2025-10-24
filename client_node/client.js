@@ -36,13 +36,13 @@ async function runSubscriber() {
 
   try {
     for await (const [topic, messageBytes] of subSocket) {
+      // --- CORREÇÃO AQUI: Desserializa para objeto e acessa .message ---
       const messageData = decode(messageBytes);
 
       readline.clearLine(process.stdout, 0);
       readline.cursorTo(process.stdout, 0);
 
-      console.log(`${messageData.message}`);
-
+      process.stdout.write(`${messageData.message}\n`);
       process.stdout.write("> ");
     }
   } catch (err) {
@@ -78,15 +78,18 @@ async function runMain() {
 
     let commandData = {};
     if (line.startsWith("/msg")) {
-      const parts = line.split(" ", 3);
+      const parts = line.split(" ");
       if (parts.length < 3) {
         console.log("(Formato: /msg <usuario> <mensagem>)");
         continue;
       }
+      const targetUser = parts[1];
+      const messageContent = parts.slice(2).join(" ");
+      
       commandData = {
         command: "private",
-        topic: parts[1],
-        payload: `${USERNAME} (privado): ${parts[2]}`
+        topic: targetUser,
+        payload: `${USERNAME} (privado): ${messageContent}`
       };
     } else {
       commandData = {
