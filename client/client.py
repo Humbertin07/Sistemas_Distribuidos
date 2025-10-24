@@ -6,9 +6,10 @@ import msgpack
 USERNAME = "py_user_1"
 
 def subscriber_thread(context, username):
-    print(f"[SUB] Thread de inscrição (MessagePack) iniciada para '{username}'...")
+    print(f"[SUB] Thread de inscrição iniciada para os tópicos 'general' e '{username}'...")
     sub_socket = context.socket(zmq.SUB)
     sub_socket.connect("tcp://message_server:5556")
+    
     sub_socket.setsockopt_string(zmq.SUBSCRIBE, "general")
     sub_socket.setsockopt_string(zmq.SUBSCRIBE, username)
 
@@ -16,9 +17,11 @@ def subscriber_thread(context, username):
         try:
             topic = sub_socket.recv_string()
             message_bytes = sub_socket.recv()
+            
+            # --- CORREÇÃO AQUI: Volta a esperar um dicionário ---
             message_data = msgpack.unpackb(message_bytes, raw=False)
             
-            print(f"\n{message_data['message']}") 
+            print(f"\r{' ' * 80}\r{message_data['message']}") 
             print("> ", end="", flush=True) 
         except zmq.ContextTerminated:
             break

@@ -1,6 +1,7 @@
 using NetMQ;
 using NetMQ.Sockets;
 using MessagePack;
+using MessagePack.Resolvers; // <-- Importante: Adiciona o Resolver
 
 Console.WriteLine("Servidor de Mensagens (C# / MessagePack) iniciado...");
 string logFile = "/data/messages.log";
@@ -12,7 +13,9 @@ using (var pubSocket = new PublisherSocket("@tcp://*:5556"))
     Console.WriteLine("Socket PUB (broadcast) escutando na porta 5556.");
     Console.WriteLine($"Log de persistência em: {logFile}");
 
-    var options = MessagePackSerializerOptions.Standard.WithCompression(MessagePackCompression.Lz4Block);
+    // --- CORREÇÃO AQUI: Usar o ContractlessStandardResolver ---
+    // Esta é a forma correta de garantir a serialização como "mapa"
+    var options = MessagePackSerializerOptions.Standard.WithResolver(ContractlessStandardResolver.Instance);
 
     using (var poller = new NetMQPoller { repSocket })
     {
@@ -55,6 +58,8 @@ using (var pubSocket = new PublisherSocket("@tcp://*:5556"))
                 {
                     { "message", broadcastMessage }
                 };
+                
+                // Serializa usando as mesmas opções
                 byte[] broadcastBytes = MessagePackSerializer.Serialize(broadcastData, options);
 
                 Console.WriteLine($"Transmitindo no tópico '{topic}'");

@@ -1,4 +1,3 @@
-# docker-compose.yml
 services:
   auth_server:
     build:
@@ -6,16 +5,26 @@ services:
     container_name: auth_server
     ports:
       - "5555:5555"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import zmq; c = zmq.Context(); s = c.socket(zmq.REQ); s.connect(\"tcp://localhost:5555\"); s.close()' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   message_server: 
     build:
       context: ./message_server
     container_name: message_server
     ports:
-      - "5556:5556" 
-      - "5557:5557" 
+      - "5556:5556"  # PUB socket
+      - "5557:5557"  # REP socket
     volumes:
-      - ./server_data:/data 
+      - ./server_data:/data
+    restart: unless-stopped
+    depends_on:
+      auth_server:
+        condition: service_healthy
 
   client_py: 
     build:
@@ -27,6 +36,7 @@ services:
     stdin_open: true 
     tty: true        
     command: ["python", "-u", "client.py"]
+    restart: "no"
 
   client_node: 
     build:
@@ -37,3 +47,8 @@ services:
       - message_server
     stdin_open: true
     tty: true
+    restart: "no"
+
+volumes:
+  server_data:
+    driver: local
