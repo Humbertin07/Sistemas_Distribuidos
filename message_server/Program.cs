@@ -1,10 +1,11 @@
 using NetMQ;
 using NetMQ.Sockets;
 using MessagePack;
-using MessagePack.Resolvers; // <-- Importante: Adiciona o Resolver
+using MessagePack.Resolvers;
 
-Console.WriteLine("Servidor de Mensagens (C# / MessagePack) iniciado...");
+Console.WriteLine("Servidor de Mensagens (C# / Relógios Lamport) iniciado...");
 string logFile = "/data/messages.log";
+long clock = 0; 
 
 using (var repSocket = new ResponseSocket("@tcp://*:5557")) 
 using (var pubSocket = new PublisherSocket("@tcp://*:5556")) 
@@ -13,9 +14,8 @@ using (var pubSocket = new PublisherSocket("@tcp://*:5556"))
     Console.WriteLine("Socket PUB (broadcast) escutando na porta 5556.");
     Console.WriteLine($"Log de persistência em: {logFile}");
 
-    // --- CORREÇÃO AQUI: Usar o ContractlessStandardResolver ---
-    // Esta é a forma correta de garantir a serialização como "mapa"
-    var options = MessagePackSerializerOptions.Standard.WithResolver(ContractlessStandardResolver.Instance);
+    var options = MessagePackSerializerOptions.Standard
+        .WithResolver(ContractlessStandardResolver.Instance); 
 
     using (var poller = new NetMQPoller { repSocket })
     {
@@ -23,11 +23,15 @@ using (var pubSocket = new PublisherSocket("@tcp://*:5556"))
         {
             byte[] commandBytes = repSocket.ReceiveFrameBytes();
             
-            Dictionary<string, string> commandData;
+            Dictionary<string, object> commandData;
             try
             {
-                commandData = MessagePackSerializer.Deserialize<Dictionary<string, string>>(commandBytes, options);
-                Console.WriteLine($"Comando recebido: {commandData["command"]}:{commandData["topic"]}");
+                commandData = MessagePackSerializer.Deserialize<Dictionary<string, object>>(commandBytes, options);
+                
+                long receivedTimestamp = Convert.ToInt64(commandData["timestamp"]);
+                clock = Math.Max(clock, receivedTimestamp) + 1;
+                
+                Console.WriteLine($"[T={clock}] Comando recebido: {commandData["command"]}:{commandData["topic"]}");
             }
             catch (Exception ex)
             {
@@ -38,7 +42,7 @@ using (var pubSocket = new PublisherSocket("@tcp://*:5556"))
 
             try
             {
-                string logEntry = $"{DateTime.UtcNow:O} | {commandData["command"]}:{commandData["topic"]}:{commandData["payload"]}\n";
+                string logEntry = $"{DateTime.UtcNow:O} | [T={clock}] | {commandData["command"]}:{commandData["topic"]}:{commandData["payload"]}\n";
                 File.AppendAllText(logFile, logEntry);
             }
             catch (Exception ex)
@@ -46,23 +50,24 @@ using (var pubSocket = new PublisherSocket("@tcp://*:5556"))
                 Console.WriteLine($"Erro ao persistir log: {ex.Message}");
             }
 
-            string command = commandData["command"];
-            string topic = commandData["topic"];
-            string payload = commandData["payload"];
+            string command = (string)commandData["command"];
+            string topic = (string)commandData["topic"];
+            string payload = (string)commandData["payload"];
 
             if (command == "publish" || command == "private")
             {
                 string broadcastMessage = $"[{topic}] {payload}";
                 
-                var broadcastData = new Dictionary<string, string>
-                {
-                    { "message", broadcastMessage }
-                };
+                clock++;
                 
-                // Serializa usando as mesmas opções
+                var broadcastData = new Dictionary<string, object>
+                {
+                    { "message", broadcastMessage },
+                    { "timestamp", clock } 
+                };
                 byte[] broadcastBytes = MessagePackSerializer.Serialize(broadcastData, options);
 
-                Console.WriteLine($"Transmitindo no tópico '{topic}'");
+                Console.WriteLine($"[T={clock}] Transmitindo no tópico '{topic}'");
                 
                 pubSocket.SendMoreFrame(topic)
                          .SendFrame(broadcastBytes); 

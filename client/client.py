@@ -4,24 +4,27 @@ import threading
 import msgpack
 
 USERNAME = "py_user_1"
+clock = 0 
 
-def subscriber_thread(context, username):
-    print(f"[SUB] Thread de inscrição iniciada para os tópicos 'general' e '{username}'...")
+def subscriber_thread(context):
+    global clock
+    print(f"[SUB] Thread de inscrição (Relógios) iniciada para '{USERNAME}'...")
     sub_socket = context.socket(zmq.SUB)
     sub_socket.connect("tcp://message_server:5556")
-    
     sub_socket.setsockopt_string(zmq.SUBSCRIBE, "general")
-    sub_socket.setsockopt_string(zmq.SUBSCRIBE, username)
+    sub_socket.setsockopt_string(zmq.SUBSCRIBE, USERNAME)
 
     while True:
         try:
             topic = sub_socket.recv_string()
             message_bytes = sub_socket.recv()
             
-            # --- CORREÇÃO AQUI: Volta a esperar um dicionário ---
             message_data = msgpack.unpackb(message_bytes, raw=False)
             
-            print(f"\r{' ' * 80}\r{message_data['message']}") 
+            received_timestamp = message_data.get('timestamp', 0)
+            clock = max(clock, received_timestamp) + 1
+            
+            print(f"\r{' ' * 80}\r(T={clock}) {message_data['message']}") 
             print("> ", end="", flush=True) 
         except zmq.ContextTerminated:
             break
@@ -30,34 +33,44 @@ def subscriber_thread(context, username):
             break
 
 def main():
-    print("Cliente principal (MessagePack) iniciado...")
+    global clock
+    print("Cliente principal (Relógios Lamport) iniciado...")
     context = zmq.Context()
     
     auth_socket = context.socket(zmq.REQ)
     auth_socket.connect("tcp://auth_server:5555")
     
-    auth_request = {"command": "login", "username": USERNAME}
+    clock += 1
+    auth_request = {
+        "command": "login", 
+        "username": USERNAME,
+        "timestamp": clock 
+    }
     auth_request_bytes = msgpack.packb(auth_request)
     
-    print(f"Autenticando como '{USERNAME}'...")
+    print(f"[T={clock}] Autenticando como '{USERNAME}'...")
     auth_socket.send(auth_request_bytes)
     
     response_bytes = auth_socket.recv()
     response_data = msgpack.unpackb(response_bytes, raw=False)
-    print(f"Resposta da autenticação: '{response_data['status']}: {response_data['message']}'")
+    
+    received_timestamp = response_data.get('timestamp', 0)
+    clock = max(clock, received_timestamp) + 1
+    
+    print(f"[T={clock}] Resposta da autenticação: '{response_data['status']}: {response_data['message']}'")
     
     if response_data['status'] != "OK":
         print("Falha na autenticação. Encerrando.")
         return
 
-    sub_thread = threading.Thread(target=subscriber_thread, args=(context, USERNAME))
+    sub_thread = threading.Thread(target=subscriber_thread, args=(context,))
     sub_thread.daemon = True 
     sub_thread.start()
 
     pub_socket = context.socket(zmq.REQ)
     pub_socket.connect("tcp://message_server:5557")
     
-    print("\nConectado! (Usando MessagePack)")
+    print("\nConectado! (Usando Relógios de Lamport)")
     print("Para canal público: <sua mensagem>")
     print("Para msg privada:  /msg <usuario_destino> <sua mensagem>")
     print("Para sair:         /sair")
@@ -89,6 +102,9 @@ def main():
                     "topic": "general",
                     "payload": f"{USERNAME}: {message_text}"
                 }
+            
+            clock += 1
+            command_data["timestamp"] = clock 
             
             command_bytes = msgpack.packb(command_data)
             pub_socket.send(command_bytes)
