@@ -11,4 +11,4 @@ FROM mcr.microsoft.com/dotnet/runtime:8.0
 WORKDIR /app
 COPY --from=build /app/publish .
 
-ENTRYPOINT ["dotnet", "MessageServer.dll"]
+ENTRYPOINT ["dotnet", "client_csharp.dll"]
