@@ -5,45 +5,42 @@ import { stdin as input, stdout as output } from "node:process";
 import { encode, decode } from "@msgpack/msgpack";
 
 const USERNAME = "node_user_1";
+let clock = 0; 
 
-console.log("Cliente Node.js (MessagePack) iniciado...");
+console.log("Cliente Node.js (Arquitetura Final) iniciado...");
 
-const authSocket = new zmq.Request();
 const subSocket = new zmq.Subscriber();
-const pubSocket = new zmq.Request();
+const reqSocket = new zmq.Request();
 
-async function authenticate() {
-  console.log(`Autenticando como '${USERNAME}'...`);
-  await authSocket.connect("tcp://auth_server:5555");
+const rl = createInterface({ input, output });
 
-  const authRequest = { command: "login", username: USERNAME };
-  const authRequestBytes = encode(authRequest);
-
-  await authSocket.send(authRequestBytes);
-
-  const [responseBytes] = await authSocket.receive();
+async function sendRequest(commandData) {
+  clock++;
+  commandData.timestamp = clock;
+  
+  await reqSocket.send(encode(commandData));
+  const [responseBytes] = await reqSocket.receive();
   const responseData = decode(responseBytes);
-
-  console.log(`Resposta da autenticação: '${responseData.status}: ${responseData.message}'`);
-  return responseData.status === "OK";
+  
+  clock = Math.max(clock, responseData.clock) + 1;
+  return responseData;
 }
 
 async function runSubscriber() {
-  console.log(`[SUB] Inscrevendo-se (MessagePack) nos tópicos 'general' e '${USERNAME}'...`);
-  subSocket.connect("tcp://message_server:5556");
+  console.log(`[SUB] Conectando ao Proxy em tcp://proxy:5558`);
+  subSocket.connect("tcp://proxy:5558");
   subSocket.subscribe("general");
   subSocket.subscribe(USERNAME);
 
   try {
     for await (const [topic, messageBytes] of subSocket) {
-      // --- CORREÇÃO AQUI: Desserializa para objeto e acessa .message ---
       const messageData = decode(messageBytes);
+      clock = Math.max(clock, messageData.timestamp) + 1;
 
       readline.clearLine(process.stdout, 0);
       readline.cursorTo(process.stdout, 0);
-
-      process.stdout.write(`${messageData.message}\n`);
-      process.stdout.write("> ");
+      process.stdout.write(`(T=${clock}) ${messageData.message}\n`);
+      rl.prompt(true);
     }
   } catch (err) {
     console.error("[SUB] Erro na thread de inscrição:", err);
@@ -51,70 +48,78 @@ async function runSubscriber() {
 }
 
 async function runMain() {
-  if (!(await authenticate())) {
+  await reqSocket.connect("tcp://broker:5555");
+
+  const authResponse = await sendRequest({ command: "login", username: USERNAME });
+  console.log(`[T=${clock}] Resposta da autenticação: '${authResponse.status}'`);
+
+  if (authResponse.status !== "OK") {
     console.log("Falha na autenticação. Encerrando.");
     process.exit(1);
   }
 
-  await pubSocket.connect("tcp://message_server:5557");
-
   runSubscriber().catch(console.error);
 
-  console.log("\nConectado! (Usando MessagePack)");
-  console.log("Para canal público: <sua mensagem>");
-  console.log("Para msg privada:  /msg <usuario_destino> <sua mensagem>");
-  console.log("Para sair:         /sair");
+  console.log("\nConectado! Comandos:");
+  console.log("/publicar <mensagem>");
+  console.log("/msg <usuario> <mensagem>");
+  console.log("/usuarios");
+  console.log("/canais");
+  console.log("/criar <canal>");
+  console.log("/sair");
 
-  const rl = createInterface({ input, output });
+  rl.prompt();
 
-  while (true) {
-    const line = await rl.question("> ");
-
+  rl.on("line", async (line) => {
     if (line.toLowerCase() === "/sair") {
-      break;
+      rl.close();
+      return;
     }
-
-    if (!line) continue;
-
+    
     let commandData = {};
-    if (line.startsWith("/msg")) {
+
+    if (line.startsWith("/usuarios")) {
+      const response = await sendRequest({ command: "users" });
+      console.log(response.users);
+    } else if (line.startsWith("/canais")) {
+      const response = await sendRequest({ command: "channels" });
+      console.log(response.channels);
+    } else if (line.startsWith("/criar ")) {
+      const channelName = line.split(" ", 2)[1];
+      const response = await sendRequest({ command: "channel", "channel": channelName });
+      console.log(response.status);
+    } else if (line.startsWith("/msg ")) {
       const parts = line.split(" ");
-      if (parts.length < 3) {
-        console.log("(Formato: /msg <usuario> <mensagem>)");
-        continue;
-      }
       const targetUser = parts[1];
       const messageContent = parts.slice(2).join(" ");
-      
       commandData = {
-        command: "private",
+        command: "message",
+        user: USERNAME,
         topic: targetUser,
         payload: `${USERNAME} (privado): ${messageContent}`
       };
+      const response = await sendRequest(commandData);
+      if (response.status !== "OK") console.log(`Erro: ${response.message}`);
     } else {
       commandData = {
         command: "publish",
+        user: USERNAME,
         topic: "general",
         payload: `${USERNAME}: ${line}`
       };
+      const response = await sendRequest(commandData);
+      if (response.status !== "OK") console.log(`Erro: ${response.message}`);
     }
-
-    const commandBytes = encode(commandData);
-    await pubSocket.send(commandBytes);
-
-    const [response] = await pubSocket.receive();
-
-    if (response.toString() !== "OK_ENVIADO") {
-      console.log(`(Erro ao enviar: ${response.toString()})`);
-    }
-  }
-
-  console.log("Fechando cliente.");
-  rl.close();
-  authSocket.close();
-  subSocket.close();
-  pubSocket.close();
-  process.exit(0);
+    
+    rl.prompt(true);
+  });
+  
+  rl.on('close', () => {
+    console.log("Fechando cliente.");
+    reqSocket.close();
+    subSocket.close();
+    process.exit(0);
+  });
 }
 
 runMain().catch(console.error);

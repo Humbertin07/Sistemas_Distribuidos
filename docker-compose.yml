@@ -1,54 +1,67 @@
 services:
-  auth_server:
-    build:
-      context: ./auth_server
-    container_name: auth_server
+  # 1. MIDDLEWARE: Roteadores e Gerenciadores
+  ref_server:
+    build: ./ref_server
+    container_name: ref_server
     ports:
-      - "5555:5555"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'import zmq; c = zmq.Context(); s = c.socket(zmq.REQ); s.connect(\"tcp://localhost:5555\"); s.close()' || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      - "5559:5559" # Porta para os servidores se registrarem
 
-  message_server: 
-    build:
-      context: ./message_server
-    container_name: message_server
+  broker:
+    build: ./broker
+    container_name: broker
     ports:
-      - "5556:5556"  # PUB socket
-      - "5557:5557"  # REP socket
+      - "5555:5555" # Porta REQ (Clientes -> Broker)
+      - "5556:5556" # Porta REP (Broker -> Servidores)
+    depends_on:
+      - server
+
+  proxy:
+    build: ./proxy
+    container_name: proxy
+    ports:
+      - "5557:5557" # Porta XSUB (Servidores -> Proxy)
+      - "5558:5558" # Porta XPUB (Proxy -> Clientes)
+    depends_on:
+      - server
+
+  # 2. WORKERS: Onde a lógica acontece (3 réplicas)
+  server:
+    build: ./server
     volumes:
       - ./server_data:/data
-    restart: unless-stopped
     depends_on:
-      auth_server:
-        condition: service_healthy
+      - ref_server
+      - broker
+      - proxy
+    deploy:
+      replicas: 3 # Requisito de replicação
 
-  client_py: 
-    build:
-      context: ./client
+  # 3. CLIENTES: Nossos 3 clientes interativos
+  client_py:
+    build: ./client_py
     container_name: client_py
-    depends_on:
-      - auth_server
-      - message_server
+    depends_on: [broker, proxy]
     stdin_open: true 
     tty: true        
     command: ["python", "-u", "client.py"]
-    restart: "no"
 
   client_node: 
-    build:
-      context: ./client_node
+    build: ./client_node
     container_name: client_node
-    depends_on:
-      - auth_server
-      - message_server
+    depends_on: [broker, proxy]
     stdin_open: true
     tty: true
-    restart: "no"
 
-volumes:
-  server_data:
-    driver: local
+  client_csharp:
+    build: ./client_csharp
+    container_name: client_csharp
+    depends_on: [broker, proxy]
+    stdin_open: true
+    tty: true
+  
+  # 4. BOTS: Clientes automáticos (2 réplicas)
+  bot:
+    build: ./bot
+    depends_on: [broker, proxy]
+    deploy:
+      replicas: 2
