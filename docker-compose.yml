@@ -1,106 +1,108 @@
 version: '3.8'
 
 services:
-  ref_server:
-    build: ./ref_server
-    container_name: ref_server
+  reference:
+    build:
+      context: ./reference
     ports:
       - "5559:5559"
     networks:
-      - chat_network
+      - chat-network
+    container_name: reference
+
+  server1:
+    build:
+      context: ./server
+    command: python server.py 1 5555
     volumes:
-      - ./server_data:/data
+      - ./data/server1:/app/data
+    depends_on:
+      - reference
+    networks:
+      - chat-network
+    container_name: server1
+
+  server2:
+    build:
+      context: ./server
+    command: python server.py 2 5555
+    volumes:
+      - ./data/server2:/app/data
+    depends_on:
+      - reference
+    networks:
+      - chat-network
+    container_name: server2
+
+  server3:
+    build:
+      context: ./server
+    command: python server.py 3 5555
+    volumes:
+      - ./data/server3:/app/data
+    depends_on:
+      - reference
+    networks:
+      - chat-network
+    container_name: server3
 
   broker:
-    build: ./broker
-    container_name: broker
+    build:
+      context: ./broker
     ports:
-      - "5656:5556"  # ← Porta externa diferente
+      - "5555:5555"
+    depends_on:
+      - server1
+      - server2
+      - server3
     networks:
-      - chat_network
+      - chat-network
+    container_name: broker
 
   proxy:
-    build: ./proxy
-    container_name: proxy
+    build:
+      context: ./proxy
     ports:
       - "5557:5557"
       - "5558:5558"
-    networks:
-      - chat_network
-
-  server_1:
-    build: ./server
-    container_name: server_1
     depends_on:
       - broker
-      - proxy
-      - ref_server
     networks:
-      - chat_network
-    volumes:
-      - ./server_data:/data
+      - chat-network
+    container_name: proxy
 
-  server_2:
-    build: ./server
-    container_name: server_2
-    depends_on:
-      - broker
-      - proxy
-      - ref_server
-    networks:
-      - chat_network
-    volumes:
-      - ./server_data:/data
-
-  server_3:
-    build: ./server
-    container_name: server_3
-    depends_on:
-      - broker
-      - proxy
-      - ref_server
-    networks:
-      - chat_network
-    volumes:
-      - ./server_data:/data
-
-  # Cliente Python
   client:
-    build: ./client_py
-    container_name: client
+    build:
+      context: ./client
     depends_on:
       - broker
       - proxy
+    networks:
+      - chat-network
+    container_name: client
     stdin_open: true
     tty: true
-    networks:
-      - chat_network
 
-  # Bots
-  bot_client_1:
-    build: ./bot
-    container_name: bot_client_1
+  bot:
+    build:
+      context: ./bot
     depends_on:
       - broker
       - proxy
-      - server_1
-      - server_2
-      - server_3
     networks:
-      - chat_network
+      - chat-network
+    deploy:
+      replicas: 3
 
-  bot_client_2:
-    build: ./bot
-    container_name: bot_client_2
+  bot_cpp:
+    build:
+      context: ./bot_cpp
     depends_on:
       - broker
       - proxy
-      - server_1
-      - server_2
-      - server_3
     networks:
-      - chat_network
+      - chat-network
 
 networks:
-  chat_network:
+  chat-network:
     driver: bridge

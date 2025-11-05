@@ -1,16 +1,42 @@
-# .gitignore
-
 # Python
-__pycache__/
 *.pyc
-.env
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
 venv/
-
-# Docker
-.dockerignore
+ENV/
 
 # Node.js
 node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
 
-# Dados
-server_data/
+# C++
+*.o
+*.exe
+bot
+a.out
+
+# Data
+*.json
+!package.json
+data/
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
