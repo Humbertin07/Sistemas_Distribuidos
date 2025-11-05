@@ -1,67 +1,106 @@
+version: '3.8'
+
 services:
-  # 1. MIDDLEWARE: Roteadores e Gerenciadores
   ref_server:
     build: ./ref_server
     container_name: ref_server
     ports:
-      - "5559:5559" # Porta para os servidores se registrarem
+      - "5559:5559"
+    networks:
+      - chat_network
+    volumes:
+      - ./server_data:/data
 
   broker:
     build: ./broker
     container_name: broker
     ports:
-      - "5555:5555" # Porta REQ (Clientes -> Broker)
-      - "5556:5556" # Porta REP (Broker -> Servidores)
-    depends_on:
-      - server
+      - "5656:5556"  # ← Porta externa diferente
+    networks:
+      - chat_network
 
   proxy:
     build: ./proxy
     container_name: proxy
     ports:
-      - "5557:5557" # Porta XSUB (Servidores -> Proxy)
-      - "5558:5558" # Porta XPUB (Proxy -> Clientes)
-    depends_on:
-      - server
+      - "5557:5557"
+      - "5558:5558"
+    networks:
+      - chat_network
 
-  # 2. WORKERS: Onde a lógica acontece (3 réplicas)
-  server:
+  server_1:
     build: ./server
-    volumes:
-      - ./server_data:/data
+    container_name: server_1
     depends_on:
-      - ref_server
       - broker
       - proxy
-    deploy:
-      replicas: 3 # Requisito de replicação
+      - ref_server
+    networks:
+      - chat_network
+    volumes:
+      - ./server_data:/data
 
-  # 3. CLIENTES: Nossos 3 clientes interativos
-  client_py:
+  server_2:
+    build: ./server
+    container_name: server_2
+    depends_on:
+      - broker
+      - proxy
+      - ref_server
+    networks:
+      - chat_network
+    volumes:
+      - ./server_data:/data
+
+  server_3:
+    build: ./server
+    container_name: server_3
+    depends_on:
+      - broker
+      - proxy
+      - ref_server
+    networks:
+      - chat_network
+    volumes:
+      - ./server_data:/data
+
+  # Cliente Python
+  client:
     build: ./client_py
-    container_name: client_py
-    depends_on: [broker, proxy]
-    stdin_open: true 
-    tty: true        
-    command: ["python", "-u", "client.py"]
-
-  client_node: 
-    build: ./client_node
-    container_name: client_node
-    depends_on: [broker, proxy]
+    container_name: client
+    depends_on:
+      - broker
+      - proxy
     stdin_open: true
     tty: true
+    networks:
+      - chat_network
 
-  client_csharp:
-    build: ./client_csharp
-    container_name: client_csharp
-    depends_on: [broker, proxy]
-    stdin_open: true
-    tty: true
-  
-  # 4. BOTS: Clientes automáticos (2 réplicas)
-  bot:
+  # Bots
+  bot_client_1:
     build: ./bot
-    depends_on: [broker, proxy]
-    deploy:
-      replicas: 2
+    container_name: bot_client_1
+    depends_on:
+      - broker
+      - proxy
+      - server_1
+      - server_2
+      - server_3
+    networks:
+      - chat_network
+
+  bot_client_2:
+    build: ./bot
+    container_name: bot_client_2
+    depends_on:
+      - broker
+      - proxy
+      - server_1
+      - server_2
+      - server_3
+    networks:
+      - chat_network
+
+networks:
+  chat_network:
+    driver: bridge
