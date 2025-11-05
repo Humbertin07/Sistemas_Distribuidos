@@ -46,7 +46,7 @@ class Server:
         
         # Sockets
         self.socket = self.context.socket(zmq.REP)
-        self.socket.bind(f"tcp://*:{self.port}")
+        self.socket.connect("tcp://broker:5556")
         
         # Socket para Reference Server
         self.ref_socket = self.context.socket(zmq.REQ)
@@ -318,22 +318,33 @@ class Server:
         # Serviços normais
         response = {}
         
+        # Extrair dados da requisição
+        service_data = data.get('data', {})
+        
         if service == 'login':
-            response = self.handle_login(data)
+            response = self.handle_login(service_data)
+        elif service == 'users':
+            response = self.handle_list_users(service_data)
+        elif service == 'channels':
+            response = self.handle_list_channels(service_data)
+        elif service == 'channel':
+            response = self.handle_create_channel(service_data)
         elif service == 'list_users':
-            response = self.handle_list_users(data)
+            response = self.handle_list_users(service_data)
         elif service == 'create_channel':
-            response = self.handle_create_channel(data)
+            response = self.handle_create_channel(service_data)
         elif service == 'list_channels':
-            response = self.handle_list_channels(data)
+            response = self.handle_list_channels(service_data)
         elif service == 'send_message':
-            response = self.handle_send_message(data)
+            response = self.handle_send_message(service_data)
         elif service == 'get_messages':
-            response = self.handle_get_messages(data)
+            response = self.handle_get_messages(service_data)
         elif service == 'publish':
-            response = self.handle_publish(data)
+            response = self.handle_publish(service_data)
         elif service == 'get_publications':
-            response = self.handle_get_publications(data)
+            response = self.handle_get_publications(service_data)
+        elif service == 'message':
+            response = self.handle_send_message(service_data)
         else:
             response = {'status': 'error', 'message': 'Serviço desconhecido'}
         
@@ -554,10 +565,18 @@ class Server:
             print(f"[SERVER-{self.server_id}] Erro ao replicar: {e}")
     
     def handle_login(self, data):
-        username = data.get('username')
+        username = data.get('user')
         
         if username in self.users:
-            return {'status': 'error', 'message': 'Usuário já existe'}
+            return {
+                'service': 'login',
+                'data': {
+                    'status': 'erro',
+                    'description': 'Usuário já existe',
+                    'timestamp': datetime.now().isoformat(),
+                    'clock': self.lamport_clock
+                }
+            }
         
         self.users[username] = {
             'username': username,
@@ -567,22 +586,38 @@ class Server:
         self.save_data()
         
         return {
-            'status': 'ok',
-            'message': 'Login realizado com sucesso',
-            'user': self.users[username]
+            'service': 'login',
+            'data': {
+                'status': 'sucesso',
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_list_users(self, data):
         return {
-            'status': 'ok',
-            'users': list(self.users.keys())
+            'service': 'users',
+            'data': {
+                'status': 'sucesso',
+                'users': list(self.users.keys()),
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_create_channel(self, data):
-        channel_name = data.get('channel_name')
+        channel_name = data.get('channel')
         
         if channel_name in self.channels:
-            return {'status': 'error', 'message': 'Canal já existe'}
+            return {
+                'service': 'channel',
+                'data': {
+                    'status': 'erro',
+                    'description': 'Canal já existe',
+                    'timestamp': datetime.now().isoformat(),
+                    'clock': self.lamport_clock
+                }
+            }
         
         self.channels[channel_name] = {
             'name': channel_name,
@@ -592,24 +627,33 @@ class Server:
         self.save_data()
         
         return {
-            'status': 'ok',
-            'message': 'Canal criado com sucesso',
-            'channel': self.channels[channel_name]
+            'service': 'channel',
+            'data': {
+                'status': 'sucesso',
+                'channel': self.channels[channel_name],
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_list_channels(self, data):
         return {
-            'status': 'ok',
-            'channels': list(self.channels.keys())
+            'service': 'channels',
+            'data': {
+                'status': 'sucesso',
+                'channels': list(self.channels.keys()),
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_send_message(self, data):
         message = {
             'id': str(uuid.uuid4()),
             'type': 'message',
-            'from': data.get('from'),
-            'to': data.get('to'),
-            'content': data.get('content'),
+            'from': data.get('src'),
+            'to': data.get('dst'),
+            'content': data.get('message'),
             'timestamp': datetime.now().isoformat(),
             'lamport_clock': self.lamport_clock
         }
@@ -622,8 +666,12 @@ class Server:
         self.replicate_data(message)
         
         return {
-            'status': 'ok',
-            'message': 'Mensagem enviada'
+            'service': 'message',
+            'data': {
+                'status': 'OK',
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_get_messages(self, data):
@@ -644,8 +692,8 @@ class Server:
             'id': str(uuid.uuid4()),
             'type': 'publication',
             'channel': data.get('channel'),
-            'from': data.get('from'),
-            'content': data.get('content'),
+            'from': data.get('user'),
+            'content': data.get('message'),
             'timestamp': datetime.now().isoformat(),
             'lamport_clock': self.lamport_clock
         }
@@ -658,8 +706,12 @@ class Server:
         self.replicate_data(publication)
         
         return {
-            'status': 'ok',
-            'message': 'Publicação realizada'
+            'service': 'publish',
+            'data': {
+                'status': 'OK',
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_get_publications(self, data):
