@@ -329,13 +329,7 @@ class Server:
             response = self.handle_list_channels(service_data)
         elif service == 'channel':
             response = self.handle_create_channel(service_data)
-        elif service == 'list_users':
-            response = self.handle_list_users(service_data)
-        elif service == 'create_channel':
-            response = self.handle_create_channel(service_data)
-        elif service == 'list_channels':
-            response = self.handle_list_channels(service_data)
-        elif service == 'send_message':
+        elif service == 'message':
             response = self.handle_send_message(service_data)
         elif service == 'get_messages':
             response = self.handle_get_messages(service_data)
@@ -343,8 +337,6 @@ class Server:
             response = self.handle_publish(service_data)
         elif service == 'get_publications':
             response = self.handle_get_publications(service_data)
-        elif service == 'message':
-            response = self.handle_send_message(service_data)
         else:
             response = {'status': 'error', 'message': 'Serviço desconhecido'}
         
@@ -683,8 +675,13 @@ class Server:
         ]
         
         return {
-            'status': 'ok',
-            'messages': user_messages
+            'service': 'get_messages',
+            'data': {
+                'status': 'sucesso',
+                'messages': user_messages,
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_publish(self, data):
@@ -723,8 +720,13 @@ class Server:
         ]
         
         return {
-            'status': 'ok',
-            'publications': channel_pubs
+            'service': 'get_publications',
+            'data': {
+                'status': 'sucesso',
+                'publications': channel_pubs,
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def load_data(self):
