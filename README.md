@@ -1,66 +1,121 @@
-# Projeto: Sistema para troca de mensagem instantânea (BBS/IRC)
+# Sistema de Mensagens Instantâneas Distribuído
 
-Este projeto é uma implementação de um sistema de mensagens instantâneas desenvolvido para a disciplina de Sistemas Distribuídos (CC7261).
+Sistema completo de troca de mensagens usando ZeroMQ, implementado em **3 linguagens**: Python, JavaScript/Node.js e C++.
 
-## Arquitetura Final
+## 🎯 Linguagens Utilizadas
 
-O sistema segue a arquitetura de microsserviços definida nos enunciados do projeto, com 3 linguagens (Python, C# e Node.js). A arquitetura é separada em:
+1. **Python** - Server, Broker, Proxy, Reference Server, Bot
+2. **JavaScript/Node.js** - Cliente interativo
+3. **C++** - Bot automático
 
-1.  **Middleware (Python):**
-    * `ref_server`: Servidor de Referência para registro, listagem e heartbeat dos workers.
-    * `broker`: Roteador ZMQ (Req-Rep) que faz o balanceamento de carga das requisições dos clientes para os workers.
-    * `proxy`: Roteador ZMQ (Pub-Sub) que distribui as mensagens publicadas pelos workers para os clientes inscritos.
-2.  **Workers (Python):**
-    * `server`: O cérebro do sistema. Temos 3 réplicas deste worker. Ele implementa toda a lógica de negócios (login, chat, canais), persiste os dados e implementa os algoritmos de eleição e replicação.
-3.  **Clientes (Python, Node.js, C#):**
-    * `client_py`, `client_node`, `client_csharp`: Clientes interativos para os usuários.
-    * `bot`: Cliente automático (2 réplicas) que gera mensagens em canais.
+## ✨ Funcionalidades
 
-## Implementações de Conceitos
+### Parte 1: Request-Reply
+- ✅ Login de usuários
+- ✅ Listagem de usuários cadastrados
+- ✅ Criação e listagem de canais
+- ✅ Persistência em disco
 
-* **Padrões ZMQ:** `Request-Reply` e `Publish-Subscribe` são usados em toda a comunicação. O `broker` e `proxy` usam `ROUTER/DEALER` e `XSUB/XPUB`.
-* **Serialização:** Toda a comunicação usa **MessagePack**.
-* **Sincronização:**
-    * **Relógios Lógicos (Lamport):** Todos os 4 componentes (`ref`, `server`, `client`, `bot`) implementam os relógios lógicos de Lamport (o `T=...`) para garantir a ordem dos eventos.
-    * **Eleição (Bully):** O `server` (worker) implementa o algoritmo Bully. Ele periodicamente consulta o `ref_server`. Se o coordenador atual não estiver na lista ativa, o servidor de maior rank se auto-elege e publica no tópico `servers`.
-* **Consistência e Replicação (Parte 5):**
-    * **Método Escolhido:** Replicação "Publisher-Subscriber" com consistência eventual.
-    * **Descrição:** O `broker` faz o balanceamento de carga (Round-Robin) entre os 3 servidores worker. Isso significa que cada worker recebe apenas uma parte das mensagens.
-    * **Troca de Dados:** Para garantir que todos os servidores tenham todos os dados (requisito da `parte5.md`), cada servidor, ao processar uma mensagem (e salvá-la em seu log local), também a **publica** no tópico `replication`. Todos os outros servidores estão **inscritos** nesse tópico. Ao receberem um log de replicação, eles o salvam em seus próprios arquivos, garantindo que eventualmente todos os servidores tenham uma cópia de todos os logs.
+### Parte 2: Publisher-Subscriber
+- ✅ Publicação em canais públicos
+- ✅ Mensagens privadas entre usuários
+- ✅ Bots automáticos
 
----
+### Parte 3: MessagePack
+- ✅ Serialização binária de todas as mensagens
 
-### Como Rodar o Projeto Completo
+### Parte 4: Relógios
+- ✅ Relógio lógico de Lamport
+- ✅ Sincronização com Algoritmo de Berkeley
+- ✅ Eleição de coordenador (Bully)
+- ✅ Reference Server
 
-1.  **Limpar o Ambiente (Se necessário):**
-    ```bash
-    docker compose down
-    docker system prune -f
-    ```
+### Parte 5: Replicação
+- ✅ Replicação entre servidores
+- ✅ Consistência eventual
+- ✅ Tolerância a falhas
 
-2.  **Construir e Subir TUDO (Middleware, Servidores e Bots):**
-    Este comando irá construir as 3 réplicas do `server` e as 2 réplicas do `bot` e iniciá-las em background.
-    ```bash
-    docker compose up --build -d
-    ```
+## 🚀 Como Executar
 
-3.  **Rodar os Clientes Interativos (Em terminais separados):**
-    Você pode escolher quais clientes rodar.
+### Pré-requisitos
+- Docker
+- Docker Compose
 
-    * **Para rodar o Cliente Python:**
-        ```bash
-        docker compose run --rm --build client_py
-        ```
-    * **Para rodar o Cliente Node.js:**
-        ```bash
-        docker compose run --rm --build client_node
-        ```
-    * **Para rodar o Cliente C#:**
-        ```bash
-        docker compose run --rm --build client_csharp
-        ```
+### Comandos
 
-4.  **Para Parar Tudo:**
-    ```bash
-    docker compose down
-    ```
+```bash
+# Construir e iniciar todos os containers
+docker-compose up --build
+
+# Executar em background
+docker-compose up -d
+
+# Ver logs
+docker-compose logs -f
+
+# Cliente interativo
+docker-compose run --rm client
+
+# Parar tudo
+docker-compose down
+
+# Limpar volumes
+docker-compose down -v
+```
+
+## 📊 Arquitetura
+
+```
+Cliente/Bot → Broker (REQ-REP) → Servidor
+    ↓                               ↓
+Proxy (PUB-SUB) ←──────────────────┘
+    ↓
+Cliente/Bot (recebe mensagens)
+
+Servidores ↔ Reference Server
+Servidores ↔ Servidores (replicação)
+```
+
+## 🔌 Portas
+
+- **5555**: Broker frontend (clientes)
+- **5556**: Broker backend (servidores)
+- **5557**: Proxy XSUB
+- **5558**: Proxy XPUB
+- **5559**: Reference Server
+- **5560**: Replicação entre servidores
+
+## 📖 Uso do Cliente
+
+Ao executar o cliente:
+
+```
+1. Listar usuários
+2. Listar canais
+3. Criar canal
+4. Inscrever-se em canal
+5. Enviar mensagem privada
+6. Publicar em canal
+7. Sair
+```
+
+## 🔄 Método de Replicação
+
+**Replicação Passiva com Consistência Eventual**
+
+1. Servidor recebe mensagem do cliente
+2. Armazena localmente
+3. Publica para outros servidores
+4. Outros servidores recebem e armazenam
+5. IDs únicos evitam duplicatas
+
+## 👨‍💻 Autor
+
+**Humberto Pellegrini**
+- GitHub: [@Humbertin07](https://github.com/Humbertin07)
+- Faculdade: FEI
+- Disciplina: Sistemas Distribuídos
+
+## 📄 Licença
+
+Projeto acadêmico - 2025

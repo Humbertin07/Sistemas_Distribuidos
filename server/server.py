@@ -1,291 +1,756 @@
 import zmq
 import msgpack
 import time
-import threading
+import json
 import os
-import random
+from datetime import datetime, timedelta
+import uuid
+import threading
 
-# --- Configuração Inicial ---
-context = zmq.Context()
-clock = 0
-server_name = f"server_{random.randint(1000, 9999)}"
-server_rank = -1
-server_list = []
-coordinator_name = ""
-log_file = f"/data/{server_name}_messages.log"
-
-print(f"Iniciando Servidor Worker: {server_name}")
-
-# Sockets de Comunicação
-req_socket = context.socket(zmq.REQ) # Para falar com o Ref Server
-dealer_socket = context.socket(zmq.DEALER) # Para receber trabalho do Broker
-pub_socket = context.socket(zmq.PUB) # Para publicar no Proxy
-sub_socket = context.socket(zmq.SUB) # Para receber replicações e eleições
-
-dealer_socket.connect("tcp://broker:5556")
-pub_socket.connect("tcp://proxy:5557")
-sub_socket.connect("tcp://proxy:5558")
-req_socket.connect("tcp://ref_server:5559")
-
-# Tópicos de Inscrição
-sub_socket.setsockopt_string(zmq.SUBSCRIBE, "replication") # Ouve por replicações
-sub_socket.setsockopt_string(zmq.SUBSCRIBE, "servers") # Ouve por eleições
-
-# --- Persistência e Estado Local ---
-# Em um sistema real, usaria um DB (SQLite, etc.). Usaremos arquivos de log.
-# O `parte5.md` exige que TODOS os servidores tenham TODOS os dados.
-# Usaremos o `log_file` principal (do servidor 0) como "fonte da verdade".
-# Esta é a nossa estratégia de replicação:
-# 1. Todos os servidores salvam seus logs localmente.
-# 2. Todos os servidores publicam seus logs no tópico "replication".
-# 3. Todos os servidores leem o tópico "replication" e salvam os logs dos outros.
-# Esta é uma implementação "Eventual Consistency".
-
-db = {
-    "users": set(),
-    "channels": {"general"}
-}
-
-def log_to_disk(log_entry):
-    global clock
-    clock += 1
-    log_line = f"T={clock} | {log_entry}\n"
-    try:
-        with open(log_file, "a") as f:
-            f.write(log_line)
-    except Exception as e:
-        print(f"Erro ao salvar log: {e}")
-
-# --- Funções de Comunicação com Ref Server (parte4.md) ---
-
-def send_to_ref_server(service, data):
-    global clock
-    clock += 1
-    req_data = {
-        "service": service,
-        "data": {
-            **data,
-            "user": server_name,
-            "clock": clock,
-            "timestamp": time.time()
+class Server:
+    def __init__(self, server_id, port=5555, reference_port=5559, replication_port=5560):
+        self.context = zmq.Context()
+        self.server_id = server_id
+        self.port = port
+        self.reference_port = reference_port
+        self.replication_port = replication_port
+        
+        # Relógio lógico de Lamport
+        self.lamport_clock = 0
+        self.clock_lock = threading.Lock()
+        
+        # Relógio físico para Berkeley
+        self.physical_clock = time.time()
+        self.clock_offset = 0.0
+        
+        # Controle de sincronização
+        self.message_count = 0
+        self.sync_interval = 10
+        
+        # Controle de eleição (Bully)
+        self.is_coordinator = False
+        self.coordinator_id = None
+        self.election_in_progress = False
+        self.election_lock = threading.Lock()
+        
+        # Dados
+        self.users = {}
+        self.channels = {}
+        self.messages = []
+        self.publications = []
+        self.processed_ids = set()
+        
+        # Dados dos servidores
+        self.servers = {}
+        self.last_heartbeat = {}
+        
+        # Sockets
+        self.socket = self.context.socket(zmq.REP)
+        self.socket.bind(f"tcp://*:{self.port}")
+        
+        # Socket para Reference Server
+        self.ref_socket = self.context.socket(zmq.REQ)
+        self.ref_socket.connect(f"tcp://reference:5559")
+        
+        # Socket PUB para replicação
+        self.pub_socket = self.context.socket(zmq.PUB)
+        self.pub_socket.bind(f"tcp://*:{self.replication_port}")
+        
+        # Socket SUB para receber replicações
+        self.sub_socket = self.context.socket(zmq.SUB)
+        self.sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        
+        # Socket REQ para comunicação entre servidores (eleição e sincronização)
+        self.server_req_socket = self.context.socket(zmq.REQ)
+        self.server_req_socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 segundo timeout
+        
+        self.load_data()
+        self.register_with_reference()
+        
+        # Iniciar threads
+        threading.Thread(target=self.send_heartbeat, daemon=True).start()
+        threading.Thread(target=self.receive_replications, daemon=True).start()
+        threading.Thread(target=self.monitor_coordinator, daemon=True).start()
+        
+        print(f"[SERVER-{self.server_id}] Servidor iniciado na porta {self.port}")
+        print(f"[SERVER-{self.server_id}] Relógio lógico: {self.lamport_clock}")
+    
+    def increment_clock(self):
+        """Incrementa o relógio lógico antes de enviar mensagens"""
+        with self.clock_lock:
+            self.lamport_clock += 1
+            return self.lamport_clock
+    
+    def update_clock(self, received_clock):
+        """Atualiza o relógio ao receber mensagens"""
+        with self.clock_lock:
+            self.lamport_clock = max(self.lamport_clock, received_clock) + 1
+            return self.lamport_clock
+    
+    def get_physical_time(self):
+        """Retorna o tempo físico ajustado"""
+        return time.time() + self.clock_offset
+    
+    def check_sync_needed(self):
+        """Verifica se precisa sincronizar após 10 mensagens"""
+        self.message_count += 1
+        if self.message_count >= self.sync_interval:
+            self.message_count = 0
+            if self.is_coordinator:
+                threading.Thread(target=self.synchronize_clocks_berkeley, daemon=True).start()
+            return True
+        return False
+    
+    def synchronize_clocks_berkeley(self):
+        """Algoritmo de Berkeley - coordenador sincroniza todos os servidores"""
+        if not self.is_coordinator:
+            return
+        
+        print(f"[SERVER-{self.server_id}] Iniciando sincronização de relógios (Berkeley)...")
+        
+        # 1. Coletar tempos de todos os servidores
+        server_times = {}
+        my_time = self.get_physical_time()
+        server_times[self.server_id] = my_time
+        
+        active_servers = [s for s in self.servers.values() 
+                         if s['server_id'] != self.server_id]
+        
+        for server in active_servers:
+            try:
+                # Conectar ao servidor
+                sock = self.context.socket(zmq.REQ)
+                sock.setsockopt(zmq.RCVTIMEO, 2000)
+                sock.connect(f"tcp://{server['address']}:{server['port']}")
+                
+                # Solicitar tempo
+                clock = self.increment_clock()
+                request = msgpack.packb({
+                    'service': 'clock',
+                    'lamport_clock': clock
+                })
+                
+                t1 = time.time()
+                sock.send(request)
+                response = msgpack.unpackb(sock.recv())
+                t2 = time.time()
+                
+                # Ajustar pelo RTT
+                rtt = t2 - t1
+                server_time = response['time'] + (rtt / 2)
+                server_times[server['server_id']] = server_time
+                
+                sock.close()
+                
+            except Exception as e:
+                print(f"[SERVER-{self.server_id}] Erro ao coletar tempo de {server['server_id']}: {e}")
+        
+        # 2. Calcular tempo médio
+        if len(server_times) > 0:
+            avg_time = sum(server_times.values()) / len(server_times)
+            
+            # 3. Calcular ajustes para cada servidor
+            adjustments = {}
+            for sid, stime in server_times.items():
+                adjustments[sid] = avg_time - stime
+            
+            print(f"[SERVER-{self.server_id}] Ajustes calculados: {adjustments}")
+            
+            # 4. Aplicar ajuste próprio
+            self.clock_offset += adjustments[self.server_id]
+            
+            # 5. Enviar ajustes para outros servidores
+            for server in active_servers:
+                sid = server['server_id']
+                if sid in adjustments:
+                    try:
+                        sock = self.context.socket(zmq.REQ)
+                        sock.setsockopt(zmq.RCVTIMEO, 2000)
+                        sock.connect(f"tcp://{server['address']}:{server['port']}")
+                        
+                        clock = self.increment_clock()
+                        request = msgpack.packb({
+                            'service': 'adjust_clock',
+                            'adjustment': adjustments[sid],
+                            'lamport_clock': clock
+                        })
+                        
+                        sock.send(request)
+                        sock.recv()
+                        sock.close()
+                        
+                    except Exception as e:
+                        print(f"[SERVER-{self.server_id}] Erro ao enviar ajuste para {sid}: {e}")
+            
+            print(f"[SERVER-{self.server_id}] Sincronização concluída. Offset: {self.clock_offset:.6f}s")
+    
+    def start_election(self):
+        """Inicia o algoritmo de eleição Bully"""
+        with self.election_lock:
+            if self.election_in_progress:
+                return
+            self.election_in_progress = True
+        
+        print(f"[SERVER-{self.server_id}] Iniciando eleição (Bully)...")
+        
+        # Encontrar servidores com ID maior
+        higher_servers = [s for s in self.servers.values() 
+                         if s['server_id'] > self.server_id]
+        
+        if not higher_servers:
+            # Sou o coordenador
+            self.become_coordinator()
+            return
+        
+        # Enviar mensagem de eleição para servidores com ID maior
+        responses = []
+        for server in higher_servers:
+            try:
+                sock = self.context.socket(zmq.REQ)
+                sock.setsockopt(zmq.RCVTIMEO, 1500)
+                sock.connect(f"tcp://{server['address']}:{server['port']}")
+                
+                clock = self.increment_clock()
+                request = msgpack.packb({
+                    'service': 'election',
+                    'type': 'ELECTION',
+                    'from': self.server_id,
+                    'lamport_clock': clock
+                })
+                
+                sock.send(request)
+                response = msgpack.unpackb(sock.recv())
+                responses.append(response)
+                sock.close()
+                
+            except Exception as e:
+                print(f"[SERVER-{self.server_id}] Servidor {server['server_id']} não respondeu")
+        
+        # Se alguém respondeu, esperar pela mensagem de coordenador
+        if responses:
+            print(f"[SERVER-{self.server_id}] Servidores superiores responderam, aguardando novo coordenador...")
+            # Aguardar 3 segundos pela mensagem de coordenador
+            time.sleep(3)
+            
+            if self.coordinator_id is None or self.coordinator_id <= self.server_id:
+                # Ninguém anunciou, iniciar nova eleição
+                self.start_election()
+        else:
+            # Ninguém respondeu, sou o coordenador
+            self.become_coordinator()
+    
+    def become_coordinator(self):
+        """Anuncia que este servidor é o novo coordenador"""
+        print(f"[SERVER-{self.server_id}] Me tornei o COORDENADOR!")
+        self.is_coordinator = True
+        self.coordinator_id = self.server_id
+        self.election_in_progress = False
+        
+        # Anunciar para todos os servidores
+        for server in self.servers.values():
+            if server['server_id'] != self.server_id:
+                try:
+                    sock = self.context.socket(zmq.REQ)
+                    sock.setsockopt(zmq.RCVTIMEO, 1000)
+                    sock.connect(f"tcp://{server['address']}:{server['port']}")
+                    
+                    clock = self.increment_clock()
+                    request = msgpack.packb({
+                        'service': 'election',
+                        'type': 'COORDINATOR',
+                        'coordinator_id': self.server_id,
+                        'lamport_clock': clock
+                    })
+                    
+                    sock.send(request)
+                    sock.recv()
+                    sock.close()
+                    
+                except Exception as e:
+                    print(f"[SERVER-{self.server_id}] Erro ao anunciar coordenação para {server['server_id']}: {e}")
+    
+    def monitor_coordinator(self):
+        """Monitora se o coordenador está ativo"""
+        while True:
+            time.sleep(5)
+            
+            if self.coordinator_id is None:
+                # Não há coordenador, iniciar eleição
+                self.start_election()
+                continue
+            
+            if self.coordinator_id == self.server_id:
+                # Eu sou o coordenador
+                continue
+            
+            # Verificar se coordenador está ativo
+            coord = next((s for s in self.servers.values() 
+                         if s['server_id'] == self.coordinator_id), None)
+            
+            if coord:
+                last_seen = self.last_heartbeat.get(coord['server_id'], 0)
+                if time.time() - last_seen > 10:
+                    print(f"[SERVER-{self.server_id}] Coordenador {self.coordinator_id} inativo! Iniciando eleição...")
+                    self.coordinator_id = None
+                    self.start_election()
+            else:
+                # Coordenador não está na lista
+                print(f"[SERVER-{self.server_id}] Coordenador {self.coordinator_id} desconhecido! Iniciando eleição...")
+                self.coordinator_id = None
+                self.start_election()
+    
+    def handle_request(self, data):
+        """Processa requisições e atualiza relógio lógico"""
+        # Atualizar relógio com o recebido
+        received_clock = data.get('lamport_clock', 0)
+        current_clock = self.update_clock(received_clock)
+        
+        service = data.get('service')
+        
+        # Serviços de sincronização e eleição
+        if service == 'clock':
+            return self.handle_clock_request(data)
+        elif service == 'adjust_clock':
+            return self.handle_adjust_clock(data)
+        elif service == 'election':
+            return self.handle_election_request(data)
+        
+        # Serviços normais
+        response = {}
+        
+        if service == 'login':
+            response = self.handle_login(data)
+        elif service == 'list_users':
+            response = self.handle_list_users(data)
+        elif service == 'create_channel':
+            response = self.handle_create_channel(data)
+        elif service == 'list_channels':
+            response = self.handle_list_channels(data)
+        elif service == 'send_message':
+            response = self.handle_send_message(data)
+        elif service == 'get_messages':
+            response = self.handle_get_messages(data)
+        elif service == 'publish':
+            response = self.handle_publish(data)
+        elif service == 'get_publications':
+            response = self.handle_get_publications(data)
+        else:
+            response = {'status': 'error', 'message': 'Serviço desconhecido'}
+        
+        # Incrementar relógio antes de enviar resposta
+        response['lamport_clock'] = self.increment_clock()
+        
+        # Verificar se precisa sincronizar
+        self.check_sync_needed()
+        
+        return response
+    
+    def handle_clock_request(self, data):
+        """Responde com o tempo físico atual (Berkeley)"""
+        current_clock = self.update_clock(data.get('lamport_clock', 0))
+        response_clock = self.increment_clock()
+        
+        return {
+            'status': 'ok',
+            'time': self.get_physical_time(),
+            'lamport_clock': response_clock
         }
-    }
-    req_socket.send(msgpack.packb(req_data))
-    response_bytes = req_socket.recv()
-    response_data = msgpack.unpackb(response_bytes, raw=False)
     
-    clock = max(clock, response_data.get("clock", 0)) + 1
-    return response_data
-
-def register_with_ref_server():
-    global server_rank
-    print(f"[T={clock}] Registrando no Servidor de Referência...")
-    response = send_to_ref_server("rank", {})
-    server_rank = response.get("rank")
-    print(f"[T={clock}] Registrado! Meu Rank: {server_rank}")
-
-def send_heartbeat():
-    while True:
-        time.sleep(15) # Envia heartbeat a cada 15s
-        send_to_ref_server("heartbeat", {})
-        print(f"[T={clock}] Heartbeat enviado.")
-
-def update_server_list():
-    global server_list, coordinator_name
-    while True:
-        time.sleep(30) # Atualiza a lista a cada 30s
-        response = send_to_ref_server("list", {})
-        server_list = response.get("list", [])
+    def handle_adjust_clock(self, data):
+        """Aplica ajuste de relógio recebido do coordenador (Berkeley)"""
+        current_clock = self.update_clock(data.get('lamport_clock', 0))
+        adjustment = data.get('adjustment', 0.0)
         
-        # Lógica de Eleição (Algoritmo Bully)
-        # Se o coordenador não estiver na lista ativa, inicia eleição
-        if coordinator_name not in [s["name"] for s in server_list]:
-            print(f"[T={clock}] Coordenador {coordinator_name} caiu! Iniciando eleição.")
-            start_election()
-
-def start_election():
-    global clock, coordinator_name
-    clock += 1
-    # Algoritmo Bully: O processo com maior rank vence.
-    # Assumimos que o rank é o ID.
-    my_rank = server_rank
-    highest_rank_server = {"name": server_name, "rank": my_rank}
-    
-    for server in server_list:
-        if server["rank"] > my_rank:
-            # Envia 'election' (não implementado, pois exigiria sockets P2P)
-            # Para simplificar (e cumprir o spec), o de maior rank se auto-elege
-            highest_rank_server = server
-            
-    if highest_rank_server["name"] == server_name:
-        # EU GANHEI!
-        clock += 1
-        coordinator_name = server_name
-        print(f"[T={clock}] Eleição: Eu ({server_name}) sou o novo Coordenador.")
+        self.clock_offset += adjustment
+        print(f"[SERVER-{self.server_id}] Relógio ajustado em {adjustment:.6f}s. Offset total: {self.clock_offset:.6f}s")
         
-        # Avisa a todos no tópico "servers"
-        pub_data = {
-            "service": "election",
-            "data": {
-                "coordinator": server_name,
-                "timestamp": time.time(),
-                "clock": clock
-            }
+        response_clock = self.increment_clock()
+        
+        return {
+            'status': 'ok',
+            'lamport_clock': response_clock
         }
-        pub_socket.send_string("servers", zmq.SNDMORE)
-        pub_socket.send(msgpack.packb(pub_data))
-
-# --- Thread de Replicação e Eleição (parte5.md) ---
-
-def subscriber_loop():
-    global clock, coordinator_name, db
-    while True:
-        topic = sub_socket.recv_string()
-        message_bytes = sub_socket.recv()
-        
-        message_data = msgpack.unpackb(message_bytes, raw=False)
-        data = message_data.get("data", {})
-        
-        received_clock = data.get("clock", 0)
-        clock = max(clock, received_clock) + 1
-
-        if topic == "servers":
-            # Alguém foi eleito
-            new_coordinator = data.get("coordinator")
-            coordinator_name = new_coordinator
-            print(f"[T={clock}] Eleição recebida: Novo coordenador é {coordinator_name}")
-            
-        elif topic == "replication":
-            # Recebe dados de replicação (log ou atualização de estado)
-            print(f"[T={clock}] Dados de replicação recebidos de {data.get('sender')}")
-            # Atualiza o estado local
-            db["users"].update(data.get("users", []))
-            db["channels"].update(data.get("channels", []))
-            # Salva o log replicado
-            log_to_disk(f"[REPLICA] {data.get('log_entry')}")
-
-# --- Loop Principal (Lógica de Negócios) ---
-
-def handle_request(request_data):
-    global clock
-    service = request_data.get("command")
-    data = request_data # O payload já é o 'data'
     
-    response_data = {"status": "OK"}
-    
-    # --- Serviços da Parte 1 ---
-    if service == "login":
-        user = data.get("username")
-        db["users"].add(user)
-        log_to_disk(f"login: {user}")
-        response_data["message"] = f"Bem-vindo, {user}!"
-    
-    elif service == "users":
-        response_data["users"] = list(db["users"])
-        log_to_disk(f"list_users")
-
-    elif service == "channel":
-        channel = data.get("channel")
-        if channel in db["channels"]:
-            response_data["status"] = "ERROR"
-            response_data["description"] = "Canal já existe"
-        else:
-            db["channels"].add(channel)
-            log_to_disk(f"create_channel: {channel}")
-            response_data["status"] = "sucesso"
-            
-    elif service == "channels":
-        response_data["channels"] = list(db["channels"])
-        log_to_disk(f"list_channels")
-
-    # --- Serviços da Parte 2 ---
-    elif service == "publish":
-        user = data.get("user", "desconhecido")
-        channel = data.get("topic")
-        payload = data.get("payload")
+    def handle_election_request(self, data):
+        """Processa mensagens de eleição (Bully)"""
+        current_clock = self.update_clock(data.get('lamport_clock', 0))
+        election_type = data.get('type')
         
-        if channel not in db["channels"]:
-            response_data["status"] = "erro"
-            response_data["message"] = "Canal não existe"
-        else:
-            log_entry = f"publish:{channel}:{user}:{payload}"
-            log_to_disk(log_entry)
+        if election_type == 'ELECTION':
+            from_server = data.get('from')
+            print(f"[SERVER-{self.server_id}] Recebi pedido de eleição de {from_server}")
             
-            # Publica no Proxy
-            clock += 1
-            pub_data = {"message": f"[{channel}] {user}: {payload}", "timestamp": clock}
-            pub_socket.send_string(channel, zmq.SNDMORE)
-            pub_socket.send(msgpack.packb(pub_data))
+            # Responder OK e iniciar minha própria eleição
+            threading.Thread(target=self.start_election, daemon=True).start()
             
-            # Publica a replicação
-            clock += 1
-            repl_data = {
-                "service": "replication",
-                "data": {"log_entry": log_entry, "sender": server_name, "clock": clock, "users": [user], "channels": []}
+            response_clock = self.increment_clock()
+            return {
+                'status': 'ok',
+                'message': 'OK',
+                'lamport_clock': response_clock
             }
-            pub_socket.send_string("replication", zmq.SNDMORE)
-            pub_socket.send(msgpack.packb(repl_data))
-
-    elif service == "message":
-        src_user = data.get("user", "desconhecido")
-        dst_user = data.get("topic")
-        payload = data.get("payload")
         
-        if dst_user not in db["users"]:
-            response_data["status"] = "erro"
-            response_data["message"] = "Usuário não existe"
-        else:
-            log_entry = f"message:{src_user}:{dst_user}:{payload}"
-            log_to_disk(log_entry)
+        elif election_type == 'COORDINATOR':
+            new_coordinator = data.get('coordinator_id')
+            print(f"[SERVER-{self.server_id}] Novo coordenador anunciado: {new_coordinator}")
             
-            # Publica no Proxy (tópico é o nome do usuário)
-            clock += 1
-            pub_data = {"message": f"[{src_user} (privado)] {payload}", "timestamp": clock}
-            pub_socket.send_string(dst_user, zmq.SNDMORE)
-            pub_socket.send(msgpack.packb(pub_data))
+            self.coordinator_id = new_coordinator
+            self.is_coordinator = (new_coordinator == self.server_id)
+            self.election_in_progress = False
             
-            # Publica a replicação
-            clock += 1
-            repl_data = {
-                "service": "replication",
-                "data": {"log_entry": log_entry, "sender": server_name, "clock": clock, "users": [src_user, dst_user], "channels": []}
+            response_clock = self.increment_clock()
+            return {
+                'status': 'ok',
+                'lamport_clock': response_clock
             }
-            pub_socket.send_string("replication", zmq.SNDMORE)
-            pub_socket.send(msgpack.packb(repl_data))
+        
+        response_clock = self.increment_clock()
+        return {
+            'status': 'error',
+            'message': 'Tipo de eleição desconhecido',
+            'lamport_clock': response_clock
+        }
+    
+    def register_with_reference(self):
+        """Registra este servidor no Reference Server"""
+        try:
+            clock = self.increment_clock()
             
-    else:
-        response_data["status"] = "ERROR"
-        response_data["message"] = "Serviço desconhecido"
-
-    clock += 1
-    response_data["timestamp"] = time.time()
-    response_data["clock"] = clock
-    return msgpack.packb(response_data)
-
-# --- Inicialização ---
-register_with_ref_server()
-start_election() # Tenta ser o coordenador ao iniciar
-
-threading.Thread(target=send_heartbeat, daemon=True).start()
-threading.Thread(target=update_server_list, daemon=True).start()
-threading.Thread(target=subscriber_loop, daemon=True).start()
-
-print(f"[T={clock}] Servidor {server_name} (Rank {server_rank}) pronto para receber trabalho.")
-
-while True:
-    # O socket DEALER do ZMQ faz o Round-Robin (load balancing)
-    # Espera por [identidade_cliente, mensagem_vazia, dados]
-    try:
-        identity, empty, message_bytes = dealer_socket.recv_multipart()
-    except zmq.ZMQError as e:
-        print(f"Erro no ZMQ: {e}")
-        time.sleep(1)
-        continue
-
-    request_data = msgpack.unpackb(message_bytes, raw=False)
+            request = msgpack.packb({
+                'service': 'register',
+                'server_id': self.server_id,
+                'address': 'server',
+                'port': self.port,
+                'lamport_clock': clock
+            })
+            
+            self.ref_socket.send(request)
+            response = msgpack.unpackb(self.ref_socket.recv())
+            
+            self.update_clock(response.get('lamport_clock', 0))
+            
+            if response.get('status') == 'ok':
+                print(f"[SERVER-{self.server_id}] Registrado no Reference Server")
+                
+                # Obter lista de servidores e conectar ao SUB
+                self.update_server_list()
+            
+        except Exception as e:
+            print(f"[SERVER-{self.server_id}] Erro ao registrar: {e}")
     
-    # Processa e envia a resposta
-    response_bytes = handle_request(request_data)
+    def update_server_list(self):
+        """Atualiza a lista de servidores do Reference Server"""
+        try:
+            clock = self.increment_clock()
+            
+            request = msgpack.packb({
+                'service': 'list_servers',
+                'lamport_clock': clock
+            })
+            
+            self.ref_socket.send(request)
+            response = msgpack.unpackb(self.ref_socket.recv())
+            
+            self.update_clock(response.get('lamport_clock', 0))
+            
+            if response.get('status') == 'ok':
+                self.servers = {s['server_id']: s for s in response.get('servers', [])}
+                
+                # Conectar aos sockets SUB de outros servidores
+                for server in self.servers.values():
+                    if server['server_id'] != self.server_id:
+                        try:
+                            address = f"tcp://{server['address']}:{self.replication_port}"
+                            self.sub_socket.connect(address)
+                            print(f"[SERVER-{self.server_id}] Conectado ao servidor {server['server_id']} para replicação")
+                        except Exception as e:
+                            print(f"[SERVER-{self.server_id}] Erro ao conectar: {e}")
+                
+                # Se não há coordenador definido, iniciar eleição
+                if self.coordinator_id is None and len(self.servers) > 0:
+                    threading.Thread(target=self.start_election, daemon=True).start()
+                    
+        except Exception as e:
+            print(f"[SERVER-{self.server_id}] Erro ao atualizar lista: {e}")
     
-    # Envia de volta para o Broker [identidade_cliente, mensagem_vazia, resposta]
-    dealer_socket.send_multipart([identity, empty, response_bytes])
+    def send_heartbeat(self):
+        """Envia heartbeat periodicamente ao Reference Server"""
+        while True:
+            try:
+                time.sleep(3)
+                
+                clock = self.increment_clock()
+                
+                request = msgpack.packb({
+                    'service': 'heartbeat',
+                    'server_id': self.server_id,
+                    'is_coordinator': self.is_coordinator,
+                    'lamport_clock': clock
+                })
+                
+                self.ref_socket.send(request)
+                response = msgpack.unpackb(self.ref_socket.recv())
+                
+                self.update_clock(response.get('lamport_clock', 0))
+                
+                # Atualizar lista de servidores periodicamente
+                if response.get('status') == 'ok':
+                    servers_data = response.get('servers', [])
+                    for server in servers_data:
+                        sid = server['server_id']
+                        self.last_heartbeat[sid] = time.time()
+                        
+                        # Atualizar coordenador se mudou
+                        if server.get('is_coordinator'):
+                            if self.coordinator_id != sid:
+                                print(f"[SERVER-{self.server_id}] Coordenador atualizado: {sid}")
+                                self.coordinator_id = sid
+                                self.is_coordinator = (sid == self.server_id)
+                
+            except Exception as e:
+                print(f"[SERVER-{self.server_id}] Erro no heartbeat: {e}")
+    
+    def receive_replications(self):
+        """Recebe replicações de outros servidores"""
+        while True:
+            try:
+                message = self.sub_socket.recv()
+                data = msgpack.unpackb(message)
+                
+                # Atualizar relógio
+                self.update_clock(data.get('lamport_clock', 0))
+                
+                msg_id = data.get('id')
+                if msg_id in self.processed_ids:
+                    continue
+                
+                self.processed_ids.add(msg_id)
+                
+                msg_type = data.get('type')
+                
+                if msg_type == 'message':
+                    self.messages.append(data)
+                    print(f"[SERVER-{self.server_id}] Mensagem replicada: {data.get('from')} -> {data.get('to')}")
+                    
+                elif msg_type == 'publication':
+                    self.publications.append(data)
+                    print(f"[SERVER-{self.server_id}] Publicação replicada em #{data.get('channel')}")
+                
+                self.save_data()
+                
+            except Exception as e:
+                print(f"[SERVER-{self.server_id}] Erro ao receber replicação: {e}")
+    
+    def replicate_data(self, data):
+        """Replica dados para outros servidores"""
+        try:
+            # Incrementar relógio antes de replicar
+            data['lamport_clock'] = self.increment_clock()
+            
+            packed = msgpack.packb(data)
+            self.pub_socket.send(packed)
+            print(f"[SERVER-{self.server_id}] Dados replicados: {data.get('type')}")
+        except Exception as e:
+            print(f"[SERVER-{self.server_id}] Erro ao replicar: {e}")
+    
+    def handle_login(self, data):
+        username = data.get('username')
+        
+        if username in self.users:
+            return {'status': 'error', 'message': 'Usuário já existe'}
+        
+        self.users[username] = {
+            'username': username,
+            'logged_at': datetime.now().isoformat()
+        }
+        
+        self.save_data()
+        
+        return {
+            'status': 'ok',
+            'message': 'Login realizado com sucesso',
+            'user': self.users[username]
+        }
+    
+    def handle_list_users(self, data):
+        return {
+            'status': 'ok',
+            'users': list(self.users.keys())
+        }
+    
+    def handle_create_channel(self, data):
+        channel_name = data.get('channel_name')
+        
+        if channel_name in self.channels:
+            return {'status': 'error', 'message': 'Canal já existe'}
+        
+        self.channels[channel_name] = {
+            'name': channel_name,
+            'created_at': datetime.now().isoformat()
+        }
+        
+        self.save_data()
+        
+        return {
+            'status': 'ok',
+            'message': 'Canal criado com sucesso',
+            'channel': self.channels[channel_name]
+        }
+    
+    def handle_list_channels(self, data):
+        return {
+            'status': 'ok',
+            'channels': list(self.channels.keys())
+        }
+    
+    def handle_send_message(self, data):
+        message = {
+            'id': str(uuid.uuid4()),
+            'type': 'message',
+            'from': data.get('from'),
+            'to': data.get('to'),
+            'content': data.get('content'),
+            'timestamp': datetime.now().isoformat(),
+            'lamport_clock': self.lamport_clock
+        }
+        
+        self.messages.append(message)
+        self.processed_ids.add(message['id'])
+        self.save_data()
+        
+        # Replicar para outros servidores
+        self.replicate_data(message)
+        
+        return {
+            'status': 'ok',
+            'message': 'Mensagem enviada'
+        }
+    
+    def handle_get_messages(self, data):
+        username = data.get('username')
+        
+        user_messages = [
+            msg for msg in self.messages
+            if msg.get('to') == username or msg.get('from') == username
+        ]
+        
+        return {
+            'status': 'ok',
+            'messages': user_messages
+        }
+    
+    def handle_publish(self, data):
+        publication = {
+            'id': str(uuid.uuid4()),
+            'type': 'publication',
+            'channel': data.get('channel'),
+            'from': data.get('from'),
+            'content': data.get('content'),
+            'timestamp': datetime.now().isoformat(),
+            'lamport_clock': self.lamport_clock
+        }
+        
+        self.publications.append(publication)
+        self.processed_ids.add(publication['id'])
+        self.save_data()
+        
+        # Replicar para outros servidores
+        self.replicate_data(publication)
+        
+        return {
+            'status': 'ok',
+            'message': 'Publicação realizada'
+        }
+    
+    def handle_get_publications(self, data):
+        channel = data.get('channel')
+        
+        channel_pubs = [
+            pub for pub in self.publications
+            if pub.get('channel') == channel
+        ]
+        
+        return {
+            'status': 'ok',
+            'publications': channel_pubs
+        }
+    
+    def load_data(self):
+        """Carrega dados do disco"""
+        try:
+            if os.path.exists('/app/data/users.json'):
+                with open('/app/data/users.json', 'r') as f:
+                    self.users = json.load(f)
+            
+            if os.path.exists('/app/data/channels.json'):
+                with open('/app/data/channels.json', 'r') as f:
+                    self.channels = json.load(f)
+            
+            if os.path.exists('/app/data/messages.json'):
+                with open('/app/data/messages.json', 'r') as f:
+                    self.messages = json.load(f)
+                    # Reconstruir processed_ids
+                    self.processed_ids = {msg.get('id') for msg in self.messages if 'id' in msg}
+            
+            if os.path.exists('/app/data/publications.json'):
+                with open('/app/data/publications.json', 'r') as f:
+                    self.publications = json.load(f)
+                    # Adicionar IDs ao conjunto
+                    self.processed_ids.update({pub.get('id') for pub in self.publications if 'id' in pub})
+            
+            print(f"[SERVER-{self.server_id}] Dados carregados do disco")
+            
+        except Exception as e:
+            print(f"[SERVER-{self.server_id}] Erro ao carregar dados: {e}")
+    
+    def save_data(self):
+        """Salva dados no disco"""
+        try:
+            os.makedirs('/app/data', exist_ok=True)
+            
+            with open('/app/data/users.json', 'w') as f:
+                json.dump(self.users, f, indent=2)
+            
+            with open('/app/data/channels.json', 'w') as f:
+                json.dump(self.channels, f, indent=2)
+            
+            with open('/app/data/messages.json', 'w') as f:
+                json.dump(self.messages, f, indent=2)
+            
+            with open('/app/data/publications.json', 'w') as f:
+                json.dump(self.publications, f, indent=2)
+            
+        except Exception as e:
+            print(f"[SERVER-{self.server_id}] Erro ao salvar dados: {e}")
+    
+    def run(self):
+        """Loop principal do servidor"""
+        print(f"[SERVER-{self.server_id}] Aguardando requisições...")
+        
+        while True:
+            try:
+                message = self.socket.recv()
+                data = msgpack.unpackb(message)
+                
+                response = self.handle_request(data)
+                
+                packed_response = msgpack.packb(response)
+                self.socket.send(packed_response)
+                
+            except Exception as e:
+                print(f"[SERVER-{self.server_id}] Erro: {e}")
+                error_response = msgpack.packb({
+                    'status': 'error',
+                    'message': str(e),
+                    'lamport_clock': self.increment_clock()
+                })
+                self.socket.send(error_response)
+
+if __name__ == '__main__':
+    import sys
+    
+    server_id = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5555
+    
+    server = Server(server_id=server_id, port=port)
+    server.run()
