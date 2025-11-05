@@ -46,15 +46,20 @@ class Server:
         
         # Sockets
         self.socket = self.context.socket(zmq.REP)
-        self.socket.bind(f"tcp://*:{self.port}")
+        self.socket.connect("tcp://broker:5556")  # ✅ Conecta ao broker
         
         # Socket para Reference Server
         self.ref_socket = self.context.socket(zmq.REQ)
         self.ref_socket.connect(f"tcp://reference:5559")
         
-        # Socket PUB para replicação
+        # Socket PUB para replicação entre servidores
         self.pub_socket = self.context.socket(zmq.PUB)
         self.pub_socket.bind(f"tcp://*:{self.replication_port}")
+        
+        # ✅ Socket PUB para publicar mensagens aos clientes via proxy
+        self.proxy_pub_socket = self.context.socket(zmq.PUB)
+        self.proxy_pub_socket.connect("tcp://proxy:5557")
+        time.sleep(0.5)  # Aguardar conexão estabilizar
         
         # Socket SUB para receber replicações
         self.sub_socket = self.context.socket(zmq.SUB)
@@ -62,7 +67,7 @@ class Server:
         
         # Socket REQ para comunicação entre servidores (eleição e sincronização)
         self.server_req_socket = self.context.socket(zmq.REQ)
-        self.server_req_socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 segundo timeout
+        self.server_req_socket.setsockopt(zmq.RCVTIMEO, 1000)
         
         self.load_data()
         self.register_with_reference()
@@ -72,8 +77,9 @@ class Server:
         threading.Thread(target=self.receive_replications, daemon=True).start()
         threading.Thread(target=self.monitor_coordinator, daemon=True).start()
         
-        print(f"[SERVER-{self.server_id}] Servidor iniciado na porta {self.port}")
-        print(f"[SERVER-{self.server_id}] Relógio lógico: {self.lamport_clock}")
+        print(f"[SERVER-{self.server_id}] Servidor iniciado")
+        print(f"[SERVER-{self.server_id}] Conectado ao broker:5556")
+        print(f"[SERVER-{self.server_id}] Conectado ao proxy:5557")
     
     def increment_clock(self):
         """Incrementa o relógio lógico antes de enviar mensagens"""
@@ -108,7 +114,6 @@ class Server:
         
         print(f"[SERVER-{self.server_id}] Iniciando sincronização de relógios (Berkeley)...")
         
-        # 1. Coletar tempos de todos os servidores
         server_times = {}
         my_time = self.get_physical_time()
         server_times[self.server_id] = my_time
@@ -118,12 +123,10 @@ class Server:
         
         for server in active_servers:
             try:
-                # Conectar ao servidor
                 sock = self.context.socket(zmq.REQ)
                 sock.setsockopt(zmq.RCVTIMEO, 2000)
                 sock.connect(f"tcp://{server['address']}:{server['port']}")
                 
-                # Solicitar tempo
                 clock = self.increment_clock()
                 request = msgpack.packb({
                     'service': 'clock',
@@ -135,7 +138,6 @@ class Server:
                 response = msgpack.unpackb(sock.recv())
                 t2 = time.time()
                 
-                # Ajustar pelo RTT
                 rtt = t2 - t1
                 server_time = response['time'] + (rtt / 2)
                 server_times[server['server_id']] = server_time
@@ -145,21 +147,17 @@ class Server:
             except Exception as e:
                 print(f"[SERVER-{self.server_id}] Erro ao coletar tempo de {server['server_id']}: {e}")
         
-        # 2. Calcular tempo médio
         if len(server_times) > 0:
             avg_time = sum(server_times.values()) / len(server_times)
             
-            # 3. Calcular ajustes para cada servidor
             adjustments = {}
             for sid, stime in server_times.items():
                 adjustments[sid] = avg_time - stime
             
             print(f"[SERVER-{self.server_id}] Ajustes calculados: {adjustments}")
             
-            # 4. Aplicar ajuste próprio
             self.clock_offset += adjustments[self.server_id]
             
-            # 5. Enviar ajustes para outros servidores
             for server in active_servers:
                 sid = server['server_id']
                 if sid in adjustments:
@@ -193,16 +191,13 @@ class Server:
         
         print(f"[SERVER-{self.server_id}] Iniciando eleição (Bully)...")
         
-        # Encontrar servidores com ID maior
         higher_servers = [s for s in self.servers.values() 
                          if s['server_id'] > self.server_id]
         
         if not higher_servers:
-            # Sou o coordenador
             self.become_coordinator()
             return
         
-        # Enviar mensagem de eleição para servidores com ID maior
         responses = []
         for server in higher_servers:
             try:
@@ -226,17 +221,13 @@ class Server:
             except Exception as e:
                 print(f"[SERVER-{self.server_id}] Servidor {server['server_id']} não respondeu")
         
-        # Se alguém respondeu, esperar pela mensagem de coordenador
         if responses:
             print(f"[SERVER-{self.server_id}] Servidores superiores responderam, aguardando novo coordenador...")
-            # Aguardar 3 segundos pela mensagem de coordenador
             time.sleep(3)
             
             if self.coordinator_id is None or self.coordinator_id <= self.server_id:
-                # Ninguém anunciou, iniciar nova eleição
                 self.start_election()
         else:
-            # Ninguém respondeu, sou o coordenador
             self.become_coordinator()
     
     def become_coordinator(self):
@@ -246,7 +237,6 @@ class Server:
         self.coordinator_id = self.server_id
         self.election_in_progress = False
         
-        # Anunciar para todos os servidores
         for server in self.servers.values():
             if server['server_id'] != self.server_id:
                 try:
@@ -275,15 +265,12 @@ class Server:
             time.sleep(5)
             
             if self.coordinator_id is None:
-                # Não há coordenador, iniciar eleição
                 self.start_election()
                 continue
             
             if self.coordinator_id == self.server_id:
-                # Eu sou o coordenador
                 continue
             
-            # Verificar se coordenador está ativo
             coord = next((s for s in self.servers.values() 
                          if s['server_id'] == self.coordinator_id), None)
             
@@ -294,15 +281,16 @@ class Server:
                     self.coordinator_id = None
                     self.start_election()
             else:
-                # Coordenador não está na lista
                 print(f"[SERVER-{self.server_id}] Coordenador {self.coordinator_id} desconhecido! Iniciando eleição...")
                 self.coordinator_id = None
                 self.start_election()
     
     def handle_request(self, data):
         """Processa requisições e atualiza relógio lógico"""
-        # Atualizar relógio com o recebido
         received_clock = data.get('lamport_clock', 0)
+        if received_clock == 0:
+            received_clock = data.get('data', {}).get('clock', 0)
+        
         current_clock = self.update_clock(received_clock)
         
         service = data.get('service')
@@ -315,32 +303,44 @@ class Server:
         elif service == 'election':
             return self.handle_election_request(data)
         
+        # ✅ Extrair dados da requisição
+        service_data = data.get('data', {})
+        
         # Serviços normais
         response = {}
         
         if service == 'login':
-            response = self.handle_login(data)
-        elif service == 'list_users':
-            response = self.handle_list_users(data)
-        elif service == 'create_channel':
-            response = self.handle_create_channel(data)
-        elif service == 'list_channels':
-            response = self.handle_list_channels(data)
-        elif service == 'send_message':
-            response = self.handle_send_message(data)
+            response = self.handle_login(service_data)
+        elif service == 'users':
+            response = self.handle_list_users(service_data)
+        elif service == 'channel':
+            response = self.handle_create_channel(service_data)
+        elif service == 'channels':
+            response = self.handle_list_channels(service_data)
+        elif service == 'message':
+            response = self.handle_send_message(service_data)
         elif service == 'get_messages':
-            response = self.handle_get_messages(data)
+            response = self.handle_get_messages(service_data)
         elif service == 'publish':
-            response = self.handle_publish(data)
+            response = self.handle_publish(service_data)
         elif service == 'get_publications':
-            response = self.handle_get_publications(data)
+            response = self.handle_get_publications(service_data)
         else:
-            response = {'status': 'error', 'message': 'Serviço desconhecido'}
+            response = {
+                'service': service,
+                'data': {
+                    'status': 'error',
+                    'message': 'Serviço desconhecido',
+                    'clock': self.lamport_clock
+                }
+            }
         
         # Incrementar relógio antes de enviar resposta
-        response['lamport_clock'] = self.increment_clock()
+        if 'data' in response and isinstance(response['data'], dict):
+            response['data']['clock'] = self.increment_clock()
+        else:
+            response['lamport_clock'] = self.increment_clock()
         
-        # Verificar se precisa sincronizar
         self.check_sync_needed()
         
         return response
@@ -380,7 +380,6 @@ class Server:
             from_server = data.get('from')
             print(f"[SERVER-{self.server_id}] Recebi pedido de eleição de {from_server}")
             
-            # Responder OK e iniciar minha própria eleição
             threading.Thread(target=self.start_election, daemon=True).start()
             
             response_clock = self.increment_clock()
@@ -431,8 +430,6 @@ class Server:
             
             if response.get('status') == 'ok':
                 print(f"[SERVER-{self.server_id}] Registrado no Reference Server")
-                
-                # Obter lista de servidores e conectar ao SUB
                 self.update_server_list()
             
         except Exception as e:
@@ -456,7 +453,6 @@ class Server:
             if response.get('status') == 'ok':
                 self.servers = {s['server_id']: s for s in response.get('servers', [])}
                 
-                # Conectar aos sockets SUB de outros servidores
                 for server in self.servers.values():
                     if server['server_id'] != self.server_id:
                         try:
@@ -466,7 +462,6 @@ class Server:
                         except Exception as e:
                             print(f"[SERVER-{self.server_id}] Erro ao conectar: {e}")
                 
-                # Se não há coordenador definido, iniciar eleição
                 if self.coordinator_id is None and len(self.servers) > 0:
                     threading.Thread(target=self.start_election, daemon=True).start()
                     
@@ -493,14 +488,12 @@ class Server:
                 
                 self.update_clock(response.get('lamport_clock', 0))
                 
-                # Atualizar lista de servidores periodicamente
                 if response.get('status') == 'ok':
                     servers_data = response.get('servers', [])
                     for server in servers_data:
                         sid = server['server_id']
                         self.last_heartbeat[sid] = time.time()
                         
-                        # Atualizar coordenador se mudou
                         if server.get('is_coordinator'):
                             if self.coordinator_id != sid:
                                 print(f"[SERVER-{self.server_id}] Coordenador atualizado: {sid}")
@@ -511,13 +504,12 @@ class Server:
                 print(f"[SERVER-{self.server_id}] Erro no heartbeat: {e}")
     
     def receive_replications(self):
-        """Recebe replicações de outros servidores"""
+        """Recebe replicações de outros servidores - ✅ COMPLETO"""
         while True:
             try:
                 message = self.sub_socket.recv()
                 data = msgpack.unpackb(message)
                 
-                # Atualizar relógio
                 self.update_clock(data.get('lamport_clock', 0))
                 
                 msg_id = data.get('id')
@@ -536,6 +528,26 @@ class Server:
                     self.publications.append(data)
                     print(f"[SERVER-{self.server_id}] Publicação replicada em #{data.get('channel')}")
                 
+                # ✅ Replicação de login
+                elif msg_type == 'login':
+                    username = data.get('username')
+                    if username not in self.users:
+                        self.users[username] = {
+                            'username': username,
+                            'logged_at': data.get('logged_at')
+                        }
+                        print(f"[SERVER-{self.server_id}] Login replicado: {username}")
+                
+                # ✅ Replicação de canal
+                elif msg_type == 'channel':
+                    channel_name = data.get('channel_name')
+                    if channel_name not in self.channels:
+                        self.channels[channel_name] = {
+                            'name': channel_name,
+                            'created_at': data.get('created_at')
+                        }
+                        print(f"[SERVER-{self.server_id}] Canal replicado: {channel_name}")
+                
                 self.save_data()
                 
             except Exception as e:
@@ -544,7 +556,6 @@ class Server:
     def replicate_data(self, data):
         """Replica dados para outros servidores"""
         try:
-            # Incrementar relógio antes de replicar
             data['lamport_clock'] = self.increment_clock()
             
             packed = msgpack.packb(data)
@@ -553,63 +564,130 @@ class Server:
         except Exception as e:
             print(f"[SERVER-{self.server_id}] Erro ao replicar: {e}")
     
+    # ========== HANDLERS CORRIGIDOS ==========
+    
     def handle_login(self, data):
-        username = data.get('username')
+        """Handler de login - ✅ CORRIGIDO COM REPLICAÇÃO"""
+        username = data.get('user')  # Cliente envia 'user'
         
         if username in self.users:
-            return {'status': 'error', 'message': 'Usuário já existe'}
+            return {
+                'service': 'login',
+                'data': {
+                    'status': 'erro',
+                    'description': 'Usuário já existe',
+                    'timestamp': datetime.now().isoformat(),
+                    'clock': self.lamport_clock
+                }
+            }
         
-        self.users[username] = {
+        # Criar registro do usuário
+        user_data = {
             'username': username,
             'logged_at': datetime.now().isoformat()
         }
         
+        self.users[username] = user_data
         self.save_data()
         
+        # ✅ Replicar login para outros servidores
+        login_replica = {
+            'id': str(uuid.uuid4()),
+            'type': 'login',
+            'username': username,
+            'logged_at': user_data['logged_at'],
+            'timestamp': datetime.now().isoformat(),
+            'lamport_clock': self.lamport_clock
+        }
+        
+        self.replicate_data(login_replica)
+        print(f"[SERVER-{self.server_id}] Login de '{username}' replicado")
+        
         return {
-            'status': 'ok',
-            'message': 'Login realizado com sucesso',
-            'user': self.users[username]
+            'service': 'login',
+            'data': {
+                'status': 'sucesso',
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_list_users(self, data):
+        """Handler de listagem de usuários"""
         return {
-            'status': 'ok',
-            'users': list(self.users.keys())
+            'service': 'users',
+            'data': {
+                'users': list(self.users.keys()),
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_create_channel(self, data):
-        channel_name = data.get('channel_name')
+        """Handler de criação de canal - ✅ CORRIGIDO COM REPLICAÇÃO"""
+        channel_name = data.get('channel')  # Cliente envia 'channel'
         
         if channel_name in self.channels:
-            return {'status': 'error', 'message': 'Canal já existe'}
+            return {
+                'service': 'channel',
+                'data': {
+                    'status': 'erro',
+                    'description': 'Canal já existe',
+                    'timestamp': datetime.now().isoformat(),
+                    'clock': self.lamport_clock
+                }
+            }
         
-        self.channels[channel_name] = {
+        # Criar canal
+        channel_data = {
             'name': channel_name,
             'created_at': datetime.now().isoformat()
         }
         
+        self.channels[channel_name] = channel_data
         self.save_data()
         
+        # ✅ Replicar criação de canal
+        channel_replica = {
+            'id': str(uuid.uuid4()),
+            'type': 'channel',
+            'channel_name': channel_name,
+            'created_at': channel_data['created_at'],
+            'timestamp': datetime.now().isoformat(),
+            'lamport_clock': self.lamport_clock
+        }
+        
+        self.replicate_data(channel_replica)
+        print(f"[SERVER-{self.server_id}] Canal '{channel_name}' replicado")
+        
         return {
-            'status': 'ok',
-            'message': 'Canal criado com sucesso',
-            'channel': self.channels[channel_name]
+            'service': 'channel',
+            'data': {
+                'status': 'sucesso',
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_list_channels(self, data):
+        """Handler de listagem de canais"""
         return {
-            'status': 'ok',
-            'channels': list(self.channels.keys())
+            'service': 'channels',
+            'data': {
+                'channels': list(self.channels.keys()),
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_send_message(self, data):
+        """Handler de envio de mensagem - ✅ CORRIGIDO COM PROXY"""
         message = {
             'id': str(uuid.uuid4()),
             'type': 'message',
-            'from': data.get('from'),
-            'to': data.get('to'),
-            'content': data.get('content'),
+            'from': data.get('src'),  # Cliente envia 'src'
+            'to': data.get('dst'),     # Cliente envia 'dst'
+            'content': data.get('message'),  # Cliente envia 'message'
             'timestamp': datetime.now().isoformat(),
             'lamport_clock': self.lamport_clock
         }
@@ -621,12 +699,37 @@ class Server:
         # Replicar para outros servidores
         self.replicate_data(message)
         
+        # ✅ Publicar para o cliente destinatário via proxy
+        dst_user = data.get('dst')
+        src_user = data.get('src')
+        msg_content = data.get('message')
+        
+        clock = self.increment_clock()
+        pub_data = {
+            'src': src_user,
+            'message': msg_content,
+            'timestamp': datetime.now().isoformat(),
+            'clock': clock
+        }
+        
+        try:
+            self.proxy_pub_socket.send_string(dst_user, zmq.SNDMORE)
+            self.proxy_pub_socket.send(msgpack.packb(pub_data))
+            print(f"[SERVER-{self.server_id}] Mensagem publicada no proxy: {src_user} -> {dst_user}")
+        except Exception as e:
+            print(f"[SERVER-{self.server_id}] Erro ao publicar no proxy: {e}")
+        
         return {
-            'status': 'ok',
-            'message': 'Mensagem enviada'
+            'service': 'message',
+            'data': {
+                'status': 'OK',
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_get_messages(self, data):
+        """Handler de obtenção de mensagens"""
         username = data.get('username')
         
         user_messages = [
@@ -635,17 +738,23 @@ class Server:
         ]
         
         return {
-            'status': 'ok',
-            'messages': user_messages
+            'service': 'get_messages',
+            'data': {
+                'status': 'ok',
+                'messages': user_messages,
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_publish(self, data):
+        """Handler de publicação - ✅ CORRIGIDO COM PROXY"""
         publication = {
             'id': str(uuid.uuid4()),
             'type': 'publication',
             'channel': data.get('channel'),
-            'from': data.get('from'),
-            'content': data.get('content'),
+            'from': data.get('user'),     # Cliente envia 'user'
+            'content': data.get('message'),  # Cliente envia 'message'
             'timestamp': datetime.now().isoformat(),
             'lamport_clock': self.lamport_clock
         }
@@ -657,12 +766,37 @@ class Server:
         # Replicar para outros servidores
         self.replicate_data(publication)
         
+        # ✅ Publicar para clientes inscritos no canal via proxy
+        channel = data.get('channel')
+        user = data.get('user')
+        msg_content = data.get('message')
+        
+        clock = self.increment_clock()
+        pub_data = {
+            'user': user,
+            'message': msg_content,
+            'timestamp': datetime.now().isoformat(),
+            'clock': clock
+        }
+        
+        try:
+            self.proxy_pub_socket.send_string(channel, zmq.SNDMORE)
+            self.proxy_pub_socket.send(msgpack.packb(pub_data))
+            print(f"[SERVER-{self.server_id}] Publicação no canal '{channel}' enviada ao proxy")
+        except Exception as e:
+            print(f"[SERVER-{self.server_id}] Erro ao publicar no proxy: {e}")
+        
         return {
-            'status': 'ok',
-            'message': 'Publicação realizada'
+            'service': 'publish',
+            'data': {
+                'status': 'OK',
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def handle_get_publications(self, data):
+        """Handler de obtenção de publicações"""
         channel = data.get('channel')
         
         channel_pubs = [
@@ -671,8 +805,13 @@ class Server:
         ]
         
         return {
-            'status': 'ok',
-            'publications': channel_pubs
+            'service': 'get_publications',
+            'data': {
+                'status': 'ok',
+                'publications': channel_pubs,
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
         }
     
     def load_data(self):
@@ -689,13 +828,11 @@ class Server:
             if os.path.exists('/app/data/messages.json'):
                 with open('/app/data/messages.json', 'r') as f:
                     self.messages = json.load(f)
-                    # Reconstruir processed_ids
                     self.processed_ids = {msg.get('id') for msg in self.messages if 'id' in msg}
             
             if os.path.exists('/app/data/publications.json'):
                 with open('/app/data/publications.json', 'r') as f:
                     self.publications = json.load(f)
-                    # Adicionar IDs ao conjunto
                     self.processed_ids.update({pub.get('id') for pub in self.publications if 'id' in pub})
             
             print(f"[SERVER-{self.server_id}] Dados carregados do disco")
