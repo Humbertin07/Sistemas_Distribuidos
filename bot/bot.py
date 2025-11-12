@@ -115,7 +115,7 @@ class Bot:
                     
                     if self.publish(channel, msg):
                         count += 1
-                        print(f"[{self.username}] #{count} → {channel}: {msg}")
+                        print(f"[{self.username}] #{count} → {channel}: {msg} [Clock: {self.logical_clock}]")
                     
                     time.sleep(random.uniform(0.5, 2.0))
                 
