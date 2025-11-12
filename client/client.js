@@ -64,6 +64,14 @@ class Client {
                 const data = msgpack.decode(msg);
                 const topicStr = topic.toString();
                 
+                // ✅ Só mostrar mensagens de tópicos que estou inscrito
+                const isSubscribed = topicStr === this.username || 
+                                   this.subscribedChannels.includes(topicStr);
+                
+                if (!isSubscribed) {
+                    continue; // Ignorar mensagens de tópicos não inscritos
+                }
+                
                 if (topicStr === this.username) {
                     console.log(`\n[PRIVADA] ${data.src}: ${data.message}`);
                     this.updateClock(data.clock);

@@ -43,6 +43,7 @@ class Server:
         # Dados dos servidores
         self.servers = {}
         self.last_heartbeat = {}
+        self.connected_servers = set()  # Track connected servers to avoid duplicates
         
         # Sockets
         self.socket = self.context.socket(zmq.REP)
@@ -125,7 +126,8 @@ class Server:
             try:
                 sock = self.context.socket(zmq.REQ)
                 sock.setsockopt(zmq.RCVTIMEO, 2000)
-                sock.connect(f"tcp://{server['address']}:{server['port']}")
+                # Use container name instead of stored address
+                sock.connect(f"tcp://server{server['server_id']}:{server['port']}")
                 
                 clock = self.increment_clock()
                 request = msgpack.packb({
@@ -164,7 +166,8 @@ class Server:
                     try:
                         sock = self.context.socket(zmq.REQ)
                         sock.setsockopt(zmq.RCVTIMEO, 2000)
-                        sock.connect(f"tcp://{server['address']}:{server['port']}")
+                        # Use container name instead of stored address
+                        sock.connect(f"tcp://server{sid}:{server['port']}")
                         
                         clock = self.increment_clock()
                         request = msgpack.packb({
@@ -203,7 +206,8 @@ class Server:
             try:
                 sock = self.context.socket(zmq.REQ)
                 sock.setsockopt(zmq.RCVTIMEO, 1500)
-                sock.connect(f"tcp://{server['address']}:{server['port']}")
+                # Use container name instead of stored address
+                sock.connect(f"tcp://server{server['server_id']}:{server['port']}")
                 
                 clock = self.increment_clock()
                 request = msgpack.packb({
@@ -242,7 +246,8 @@ class Server:
                 try:
                     sock = self.context.socket(zmq.REQ)
                     sock.setsockopt(zmq.RCVTIMEO, 1000)
-                    sock.connect(f"tcp://{server['address']}:{server['port']}")
+                    # Use container name instead of stored address
+                    sock.connect(f"tcp://server{server['server_id']}:{server['port']}")
                     
                     clock = self.increment_clock()
                     request = msgpack.packb({
@@ -453,14 +458,18 @@ class Server:
             if response.get('status') == 'ok':
                 self.servers = {s['server_id']: s for s in response.get('servers', [])}
                 
+                # Connect to servers we haven't connected to yet
                 for server in self.servers.values():
                     if server['server_id'] != self.server_id:
-                        try:
-                            address = f"tcp://{server['address']}:{self.replication_port}"
-                            self.sub_socket.connect(address)
-                            print(f"[SERVER-{self.server_id}] Conectado ao servidor {server['server_id']} para replicação")
-                        except Exception as e:
-                            print(f"[SERVER-{self.server_id}] Erro ao conectar: {e}")
+                        server_id = server['server_id']
+                        if server_id not in self.connected_servers:
+                            try:
+                                address = f"tcp://server{server_id}:{self.replication_port}"
+                                self.sub_socket.connect(address)
+                                self.connected_servers.add(server_id)
+                                print(f"[SERVER-{self.server_id}] Conectado ao servidor {server_id} para replicação em {address}")
+                            except Exception as e:
+                                print(f"[SERVER-{self.server_id}] Erro ao conectar ao servidor {server_id}: {e}")
                 
                 if self.coordinator_id is None and len(self.servers) > 0:
                     threading.Thread(target=self.start_election, daemon=True).start()
@@ -681,13 +690,28 @@ class Server:
         }
     
     def handle_send_message(self, data):
-        """Handler de envio de mensagem - ✅ CORRIGIDO COM PROXY"""
+        """Handler de envio de mensagem - ✅ CORRIGIDO COM PROXY E VALIDAÇÃO"""
+        dst_user = data.get('dst')
+        src_user = data.get('src')
+        
+        # ✅ Validar se usuário destinatário existe
+        if dst_user not in self.users:
+            return {
+                'service': 'message',
+                'data': {
+                    'status': 'erro',
+                    'message': f'Usuário "{dst_user}" não existe',
+                    'timestamp': datetime.now().isoformat(),
+                    'clock': self.lamport_clock
+                }
+            }
+        
         message = {
             'id': str(uuid.uuid4()),
             'type': 'message',
-            'from': data.get('src'),  # Cliente envia 'src'
-            'to': data.get('dst'),     # Cliente envia 'dst'
-            'content': data.get('message'),  # Cliente envia 'message'
+            'from': src_user,
+            'to': dst_user,
+            'content': data.get('message'),
             'timestamp': datetime.now().isoformat(),
             'lamport_clock': self.lamport_clock
         }
@@ -700,8 +724,6 @@ class Server:
         self.replicate_data(message)
         
         # ✅ Publicar para o cliente destinatário via proxy
-        dst_user = data.get('dst')
-        src_user = data.get('src')
         msg_content = data.get('message')
         
         clock = self.increment_clock()
@@ -748,13 +770,28 @@ class Server:
         }
     
     def handle_publish(self, data):
-        """Handler de publicação - ✅ CORRIGIDO COM PROXY"""
+        """Handler de publicação - ✅ CORRIGIDO COM PROXY E VALIDAÇÃO"""
+        channel = data.get('channel')
+        user = data.get('user')
+        
+        # ✅ Validar se canal existe
+        if channel not in self.channels:
+            return {
+                'service': 'publish',
+                'data': {
+                    'status': 'erro',
+                    'message': f'Canal "{channel}" não existe',
+                    'timestamp': datetime.now().isoformat(),
+                    'clock': self.lamport_clock
+                }
+            }
+        
         publication = {
             'id': str(uuid.uuid4()),
             'type': 'publication',
-            'channel': data.get('channel'),
-            'from': data.get('user'),     # Cliente envia 'user'
-            'content': data.get('message'),  # Cliente envia 'message'
+            'channel': channel,
+            'from': user,
+            'content': data.get('message'),
             'timestamp': datetime.now().isoformat(),
             'lamport_clock': self.lamport_clock
         }
@@ -767,8 +804,6 @@ class Server:
         self.replicate_data(publication)
         
         # ✅ Publicar para clientes inscritos no canal via proxy
-        channel = data.get('channel')
-        user = data.get('user')
         msg_content = data.get('message')
         
         clock = self.increment_clock()
