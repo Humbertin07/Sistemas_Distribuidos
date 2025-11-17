@@ -9,11 +9,13 @@ import threading
 
 class Server:
     def __init__(self, server_id, port=5555, reference_port=5559, replication_port=5560):
+        print(f"[INIT] Iniciando servidor {server_id}...", flush=True)
         self.context = zmq.Context()
         self.server_id = server_id
         self.port = port
         self.reference_port = reference_port
         self.replication_port = replication_port
+        print(f"[INIT] Contexto ZMQ criado", flush=True)
         
         # Relógio lógico de Lamport
         self.lamport_clock = 0
@@ -44,6 +46,7 @@ class Server:
         self.servers = {}
         self.last_heartbeat = {}
         self.connected_servers = set()  # Track connected servers to avoid duplicates
+        self.is_syncing = False  # Flag para evitar sincronização recursiva
         
         # Sockets
         self.socket = self.context.socket(zmq.REP)
@@ -70,16 +73,20 @@ class Server:
         self.server_req_socket = self.context.socket(zmq.REQ)
         self.server_req_socket.setsockopt(zmq.RCVTIMEO, 1000)
         
+        print(f"[INIT] Carregando dados...", flush=True)
         self.load_data()
+        print(f"[INIT] Registrando com reference server...", flush=True)
         self.register_with_reference()
         
         # Iniciar threads
+        print(f"[INIT] Iniciando threads...", flush=True)
         threading.Thread(target=self.send_heartbeat, daemon=True).start()
         threading.Thread(target=self.receive_replications, daemon=True).start()
         threading.Thread(target=self.monitor_coordinator, daemon=True).start()
+        threading.Thread(target=self.periodic_sync, daemon=True).start()
         
-        print(f"[SERVER-{self.server_id}] Servidor iniciado")
-        print(f"[SERVER-{self.server_id}] Conectado ao broker:5556")
+        print(f"[SERVER-{self.server_id}] Servidor iniciado", flush=True)
+        print(f"[SERVER-{self.server_id}] Conectado ao broker:5556", flush=True)
         print(f"[SERVER-{self.server_id}] Conectado ao proxy:5557")
     
     def increment_clock(self):
@@ -330,6 +337,10 @@ class Server:
             response = self.handle_publish(service_data)
         elif service == 'get_publications':
             response = self.handle_get_publications(service_data)
+        elif service == 'sync_messages':
+            response = self.handle_sync_messages(service_data)
+        elif service == 'sync_publications':
+            response = self.handle_sync_publications(service_data)
         else:
             response = {
                 'service': service,
@@ -503,6 +514,20 @@ class Server:
                         sid = server['server_id']
                         self.last_heartbeat[sid] = time.time()
                         
+                        # Conectar a novos servidores
+                        if sid != self.server_id and sid not in self.connected_servers:
+                            try:
+                                address = f"tcp://server{sid}:{self.replication_port}"
+                                self.sub_socket.connect(address)
+                                self.connected_servers.add(sid)
+                                print(f"[SERVER-{self.server_id}] Conectado ao servidor {sid} para replicação")
+                            except Exception as e:
+                                print(f"[SERVER-{self.server_id}] Erro ao conectar ao servidor {sid}: {e}")
+                        
+                        # Atualizar dict de servidores
+                        if sid not in self.servers:
+                            self.servers[sid] = server
+                        
                         if server.get('is_coordinator'):
                             if self.coordinator_id != sid:
                                 print(f"[SERVER-{self.server_id}] Coordenador atualizado: {sid}")
@@ -537,25 +562,23 @@ class Server:
                     self.publications.append(data)
                     print(f"[SERVER-{self.server_id}] Publicação replicada em #{data.get('channel')}")
                 
-                # ✅ Replicação de login
+                # ✅ Replicação de login (SEMPRE atualiza para garantir sincronização)
                 elif msg_type == 'login':
                     username = data.get('username')
-                    if username not in self.users:
-                        self.users[username] = {
-                            'username': username,
-                            'logged_at': data.get('logged_at')
-                        }
-                        print(f"[SERVER-{self.server_id}] Login replicado: {username}")
+                    self.users[username] = {
+                        'username': username,
+                        'logged_at': data.get('logged_at')
+                    }
+                    print(f"[SERVER-{self.server_id}] Login replicado: {username}")
                 
-                # ✅ Replicação de canal
+                # ✅ Replicação de canal (SEMPRE atualiza para garantir sincronização)
                 elif msg_type == 'channel':
                     channel_name = data.get('channel_name')
-                    if channel_name not in self.channels:
-                        self.channels[channel_name] = {
-                            'name': channel_name,
-                            'created_at': data.get('created_at')
-                        }
-                        print(f"[SERVER-{self.server_id}] Canal replicado: {channel_name}")
+                    self.channels[channel_name] = {
+                        'name': channel_name,
+                        'created_at': data.get('created_at')
+                    }
+                    print(f"[SERVER-{self.server_id}] Canal replicado: {channel_name}")
                 
                 self.save_data()
                 
@@ -572,6 +595,134 @@ class Server:
             print(f"[SERVER-{self.server_id}] Dados replicados: {data.get('type')}")
         except Exception as e:
             print(f"[SERVER-{self.server_id}] Erro ao replicar: {e}")
+    
+    def sync_from_other_servers(self):
+        """Sincroniza dados de todos os outros servidores ativos - ✅ COMPLETO"""
+        if len(self.servers) == 0 or self.is_syncing:
+            return  # Sem outros servidores ou já está sincronizando
+        
+        self.is_syncing = True  # Marcar que está sincronizando
+        
+        try:
+            print(f"[SERVER-{self.server_id}] Sincronizando com {len(self.servers)-1} servidores...")
+            
+            users_synced = 0
+            channels_synced = 0
+            messages_synced = 0
+            publications_synced = 0
+            
+            for server in self.servers.values():
+                if server['server_id'] == self.server_id:
+                    continue
+                
+                sock = None
+                try:
+                    # Criar socket temporário para pedir dados
+                    sock = self.context.socket(zmq.REQ)
+                    sock.setsockopt(zmq.RCVTIMEO, 2000)  # Timeout aumentado
+                    sock.setsockopt(zmq.LINGER, 0)  # Não esperar ao fechar
+                    sock.connect(f"tcp://server{server['server_id']}:{server['port']}")
+                    
+                    # ✅ Pedir usuários
+                    request = msgpack.packb({
+                        'service': 'users',
+                        'data': {},
+                        'lamport_clock': self.increment_clock()
+                    })
+                    sock.send(request)
+                    response = msgpack.unpackb(sock.recv())
+                    
+                    if response.get('data', {}).get('users'):
+                        for user in response['data']['users']:
+                            if user not in self.users:
+                                self.users[user] = {
+                                    'username': user,
+                                    'logged_at': datetime.now().isoformat()
+                                }
+                                users_synced += 1
+                    
+                    # ✅ Pedir canais
+                    request = msgpack.packb({
+                        'service': 'channels',
+                        'data': {},
+                        'lamport_clock': self.increment_clock()
+                    })
+                    sock.send(request)
+                    response = msgpack.unpackb(sock.recv())
+                    
+                    if response.get('data', {}).get('channels'):
+                        for channel in response['data']['channels']:
+                            if channel not in self.channels:
+                                self.channels[channel] = {
+                                    'name': channel,
+                                    'created_at': datetime.now().isoformat()
+                                }
+                                channels_synced += 1
+                    
+                    # ✅ Pedir mensagens (se aplicável - para servidores com poucos dados)
+                    if len(self.messages) < 100:  # Só sincroniza se tiver menos de 100 mensagens
+                        request = msgpack.packb({
+                            'service': 'sync_messages',
+                            'data': {},
+                            'lamport_clock': self.increment_clock()
+                        })
+                        sock.send(request)
+                        response = msgpack.unpackb(sock.recv())
+                        
+                        if response.get('data', {}).get('messages'):
+                            for msg in response['data']['messages']:
+                                msg_id = msg.get('id')
+                                if msg_id and msg_id not in self.processed_ids:
+                                    self.messages.append(msg)
+                                    self.processed_ids.add(msg_id)
+                                    messages_synced += 1
+                    
+                    # ✅ Pedir publicações (se aplicável - para servidores com poucos dados)
+                    if len(self.publications) < 500:  # Só sincroniza se tiver menos de 500 publicações
+                        request = msgpack.packb({
+                            'service': 'sync_publications',
+                            'data': {},
+                            'lamport_clock': self.increment_clock()
+                        })
+                        sock.send(request)
+                        response = msgpack.unpackb(sock.recv())
+                        
+                        if response.get('data', {}).get('publications'):
+                            for pub in response['data']['publications']:
+                                pub_id = pub.get('id')
+                                if pub_id and pub_id not in self.processed_ids:
+                                    self.publications.append(pub)
+                                    self.processed_ids.add(pub_id)
+                                    publications_synced += 1
+                    
+                except zmq.error.Again:
+                    # Timeout - servidor pode estar ocupado
+                    pass
+                except Exception as e:
+                    print(f"[SERVER-{self.server_id}] Erro ao sincronizar com server{server['server_id']}: {e}")
+                finally:
+                    if sock:
+                        sock.close()
+            
+            if users_synced > 0 or channels_synced > 0 or messages_synced > 0 or publications_synced > 0:
+                print(f"[SERVER-{self.server_id}] Sincronizados: {users_synced} usuários, {channels_synced} canais, {messages_synced} mensagens, {publications_synced} publicações")
+                self.save_data()
+        
+        finally:
+            self.is_syncing = False  # Liberar flag de sincronização
+    
+    def periodic_sync(self):
+        """Sincronização periódica a cada 30 segundos"""
+        print(f"[SERVER-{self.server_id}] Thread de sincronização periódica iniciada", flush=True)
+        time.sleep(15)  # Espera inicial para os servidores se conectarem
+        
+        while True:
+            try:
+                if len(self.servers) > 0:  # Só sincroniza se conhecer outros servidores
+                    self.sync_from_other_servers()
+                time.sleep(30)  # Sincroniza a cada 30 segundos
+            except Exception as e:
+                print(f"[SERVER-{self.server_id}] Erro na sincronização periódica: {e}", flush=True)
     
     # ========== HANDLERS CORRIGIDOS ==========
     
@@ -622,7 +773,11 @@ class Server:
         }
     
     def handle_list_users(self, data):
-        """Handler de listagem de usuários"""
+        """Handler de listagem de usuários - ✅ COM SINCRONIZAÇÃO FORÇADA"""
+        # Sincronizar com outros servidores ANTES de retornar (se não estiver já sincronizando)
+        if not self.is_syncing:
+            self.sync_from_other_servers()
+        
         return {
             'service': 'users',
             'data': {
@@ -679,7 +834,11 @@ class Server:
         }
     
     def handle_list_channels(self, data):
-        """Handler de listagem de canais"""
+        """Handler de listagem de canais - ✅ COM SINCRONIZAÇÃO FORÇADA"""
+        # Sincronizar com outros servidores ANTES de retornar (se não estiver já sincronizando)
+        if not self.is_syncing:
+            self.sync_from_other_servers()
+        
         return {
             'service': 'channels',
             'data': {
@@ -694,17 +853,22 @@ class Server:
         dst_user = data.get('dst')
         src_user = data.get('src')
         
-        # ✅ Validar se usuário destinatário existe
+        # ✅ Validar se usuário destinatário existe - se não, tenta sincronizar primeiro
         if dst_user not in self.users:
-            return {
-                'service': 'message',
-                'data': {
-                    'status': 'erro',
-                    'message': f'Usuário "{dst_user}" não existe',
-                    'timestamp': datetime.now().isoformat(),
-                    'clock': self.lamport_clock
+            print(f"[SERVER-{self.server_id}] Usuário '{dst_user}' não encontrado, tentando sincronizar...")
+            self.sync_from_other_servers()
+            
+            # Verifica novamente após sincronização
+            if dst_user not in self.users:
+                return {
+                    'service': 'message',
+                    'data': {
+                        'status': 'erro',
+                        'message': f'Usuário "{dst_user}" não existe',
+                        'timestamp': datetime.now().isoformat(),
+                        'clock': self.lamport_clock
+                    }
                 }
-            }
         
         message = {
             'id': str(uuid.uuid4()),
@@ -774,17 +938,22 @@ class Server:
         channel = data.get('channel')
         user = data.get('user')
         
-        # ✅ Validar se canal existe
+        # ✅ Validar se canal existe - se não, tenta sincronizar primeiro
         if channel not in self.channels:
-            return {
-                'service': 'publish',
-                'data': {
-                    'status': 'erro',
-                    'message': f'Canal "{channel}" não existe',
-                    'timestamp': datetime.now().isoformat(),
-                    'clock': self.lamport_clock
+            print(f"[SERVER-{self.server_id}] Canal '{channel}' não encontrado, tentando sincronizar...")
+            self.sync_from_other_servers()
+            
+            # Verifica novamente após sincronização
+            if channel not in self.channels:
+                return {
+                    'service': 'publish',
+                    'data': {
+                        'status': 'erro',
+                        'message': f'Canal "{channel}" não existe',
+                        'timestamp': datetime.now().isoformat(),
+                        'clock': self.lamport_clock
+                    }
                 }
-            }
         
         publication = {
             'id': str(uuid.uuid4()),
@@ -844,6 +1013,30 @@ class Server:
             'data': {
                 'status': 'ok',
                 'publications': channel_pubs,
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
+        }
+    
+    def handle_sync_messages(self, data):
+        """Handler para sincronização de mensagens entre servidores"""
+        return {
+            'service': 'sync_messages',
+            'data': {
+                'status': 'ok',
+                'messages': self.messages,
+                'timestamp': datetime.now().isoformat(),
+                'clock': self.lamport_clock
+            }
+        }
+    
+    def handle_sync_publications(self, data):
+        """Handler para sincronização de publicações entre servidores"""
+        return {
+            'service': 'sync_publications',
+            'data': {
+                'status': 'ok',
+                'publications': self.publications,
                 'timestamp': datetime.now().isoformat(),
                 'clock': self.lamport_clock
             }
