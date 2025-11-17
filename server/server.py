@@ -199,12 +199,13 @@ class Server:
                 return
             self.election_in_progress = True
         
-        print(f"[SERVER-{self.server_id}] Iniciando eleição (Bully)...")
+        print(f"[SERVER-{self.server_id}] 🗳️  INICIANDO ELEIÇÃO (Bully)...")
         
         higher_servers = [s for s in self.servers.values() 
                          if s['server_id'] > self.server_id]
         
         if not higher_servers:
+            print(f"[SERVER-{self.server_id}] Nenhum servidor com ID maior encontrado")
             self.become_coordinator()
             return
         
@@ -228,9 +229,10 @@ class Server:
                 response = msgpack.unpackb(sock.recv())
                 responses.append(response)
                 sock.close()
+                print(f"[SERVER-{self.server_id}] ✅ Servidor {server['server_id']} respondeu à eleição")
                 
             except Exception as e:
-                print(f"[SERVER-{self.server_id}] Servidor {server['server_id']} não respondeu")
+                print(f"[SERVER-{self.server_id}] ❌ Servidor {server['server_id']} não respondeu")
         
         if responses:
             print(f"[SERVER-{self.server_id}] Servidores superiores responderam, aguardando novo coordenador...")
@@ -243,10 +245,11 @@ class Server:
     
     def become_coordinator(self):
         """Anuncia que este servidor é o novo coordenador"""
-        print(f"[SERVER-{self.server_id}] Me tornei o COORDENADOR!")
+        print(f"[SERVER-{self.server_id}] 👑 ELEIÇÃO VENCIDA! Me tornei o COORDENADOR!")
         self.is_coordinator = True
         self.coordinator_id = self.server_id
         self.election_in_progress = False
+        print(f"[SERVER-{self.server_id}] 📢 Anunciando coordenação para outros servidores...")
         
         for server in self.servers.values():
             if server['server_id'] != self.server_id:
@@ -267,9 +270,10 @@ class Server:
                     sock.send(request)
                     sock.recv()
                     sock.close()
+                    print(f"[SERVER-{self.server_id}] ✅ Coordenação anunciada para servidor {server['server_id']}")
                     
                 except Exception as e:
-                    print(f"[SERVER-{self.server_id}] Erro ao anunciar coordenação para {server['server_id']}: {e}")
+                    print(f"[SERVER-{self.server_id}] ❌ Erro ao anunciar coordenação para {server['server_id']}: {e}")
     
     def monitor_coordinator(self):
         """Monitora se o coordenador está ativo"""
@@ -289,11 +293,11 @@ class Server:
             if coord:
                 last_seen = self.last_heartbeat.get(coord['server_id'], 0)
                 if time.time() - last_seen > 10:
-                    print(f"[SERVER-{self.server_id}] Coordenador {self.coordinator_id} inativo! Iniciando eleição...")
+                    print(f"[SERVER-{self.server_id}] ⚠️  COORDENADOR {self.coordinator_id} INATIVO! Iniciando eleição...")
                     self.coordinator_id = None
                     self.start_election()
             else:
-                print(f"[SERVER-{self.server_id}] Coordenador {self.coordinator_id} desconhecido! Iniciando eleição...")
+                print(f"[SERVER-{self.server_id}] ⚠️  Coordenador {self.coordinator_id} desconhecido! Iniciando eleição...")
                 self.coordinator_id = None
                 self.start_election()
     
@@ -394,7 +398,8 @@ class Server:
         
         if election_type == 'ELECTION':
             from_server = data.get('from')
-            print(f"[SERVER-{self.server_id}] Recebi pedido de eleição de {from_server}")
+            print(f"[SERVER-{self.server_id}] 📨 Recebi pedido de eleição do servidor {from_server}")
+            print(f"[SERVER-{self.server_id}] 🔄 Iniciando minha própria eleição...")
             
             threading.Thread(target=self.start_election, daemon=True).start()
             
@@ -407,11 +412,12 @@ class Server:
         
         elif election_type == 'COORDINATOR':
             new_coordinator = data.get('coordinator_id')
-            print(f"[SERVER-{self.server_id}] Novo coordenador anunciado: {new_coordinator}")
+            print(f"[SERVER-{self.server_id}] 👑 NOVO COORDENADOR ANUNCIADO: Servidor {new_coordinator}")
             
             self.coordinator_id = new_coordinator
             self.is_coordinator = (new_coordinator == self.server_id)
             self.election_in_progress = False
+            print(f"[SERVER-{self.server_id}] ✅ Coordenador atualizado com sucesso")
             
             response_clock = self.increment_clock()
             return {
